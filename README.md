@@ -4,6 +4,8 @@ An advanced and configurable RF-to-Network bridge running on an ESP8266. This pr
 
 The entire system is configured through a responsive web interface, with all settings saved to the ESP8266's internal EEPROM.
 
+![Web UI Screenshot](./docs/web-ui.png)
+
 ## Key Features
 
 - **RF Transceiver:** Receives and transmits 433MHz signals using a CC1101 module.
