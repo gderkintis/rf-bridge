@@ -146,16 +146,10 @@ uint16_t nextRfMappingId = 1; // Counter for unique RF Mapping IDs
 #define CC1101_BANDWIDTH_EEPROM_ADDR (CC1101_FREQ_EEPROM_ADDR + sizeof(float))
 #define CC1101_RATE_EEPROM_ADDR (CC1101_BANDWIDTH_EEPROM_ADDR + sizeof(float))
 #define EEPROM_REBOOT_FLAG_ADDR (CC1101_RATE_EEPROM_ADDR + sizeof(float))
+const byte REBOOT_FLAG_MAGIC_BYTE = 0xD7; // Magic byte for the EEPROM reboot flag
 // --- End EEPROM Configuration ---
 
-// --- Web Page Content (PROGMEM) ---
-
 // --- Global Variables ---
-bool g_justRebootedFromClientCommand = false; // Flag to indicate if reboot was client-initiated
-const byte REBOOT_FLAG_MAGIC_BYTE = 0xD7; // Magic byte for the EEPROM reboot flag
-const char PAGE_MAIN_HEADER_START[] PROGMEM = R"=====(
-<!DOCTYPE html>
-)=====";
 void loadRfMappingsFromEEPROM();
 bool saveRfMappingsToEEPROM();
 void handleSerialCommands();
@@ -163,7 +157,6 @@ void printHelp();
 void initialize_cc1101();
 bool loadConfiguration();
 void saveConfiguration();
-void interactiveConfigSetup();
 void handleRoot();
 void handleNotFound();
 
@@ -171,7 +164,6 @@ void setClock();
 void parseAndAddHeader(HTTPClient& http, const char* headerLine);
 void webSocketEvent(uint8_t num, WStype_t type, uint8_t * payload, size_t length); // WebSocket event handler
 void RPCEvent(WStype_t type, uint8_t * payload, size_t length); // RPC WebSocket client event handler
-void connectToDevice();
 void requestDeviceSwitchStatus(); // New: to get current device switch state
 void sendRpcCommand(const JsonDocument& doc, int switchId, uint16_t originatingMappingId, const String& commandType);
 void sendDeviceToggleCommand(const char* deviceIp, int switchId, uint16_t originatingMappingId);
@@ -182,6 +174,10 @@ void broadcastStatusUpdate(); // Send full status to all WebSocket clients
 void broadcastAlert(const String& paneId, const String& message, const String& alertType, int duration = 5000); // Send alert to all WebSocket clients
 void handleWebSocketCommand(uint8_t clientNum, const char* action, JsonObject& cmdPayload); // New handler for WS commands
 String escapeJsonString(const String& str); // Forward declaration
+void interactiveConfigSetup(); // Forward declaration for interactive setup
+
+// --- Global Variables ---
+bool g_justRebootedFromClientCommand = false; // Flag to indicate if reboot was client-initiated
 
 void setup() {
   Serial.begin(9600);
@@ -932,14 +928,6 @@ void handleSerialCommands() {
   }
 }
 
-void sendCardWrapperStart() {
-    server.sendContent("<div class=\"mb-3\" style=\"max-width: 720px; margin-left: auto; margin-right: auto;\">");
-}
-
-void sendCardWrapperEnd() {
-    server.sendContent("</div>");
-}
-
 // Helper to escape strings for JSON
 String escapeJsonString(const String& str) {
   String escapedStr = str;
@@ -1154,14 +1142,6 @@ void loop() {
   // A more robust solution would involve managing multiple client connections or a single dynamic one.
   RPC.loop(); // Still need to process events if a connection was manually established by an action
   yield(); // Allow ESP8266 background tasks to run
-}
-
-void connectToDevice() {
-    // This function needs a target IP to connect to.
-    // It's no longer suitable for a global, automatic connection attempt without a global IP.
-    // It might be called by individual actions with a specific IP in the future.
-    Serial.println("connectToDevice() called - Note: This function is now intended for on-demand connection with a specific IP (not yet implemented here).");
-    // The actual connection result will be handled in RPCEvent
 }
 
 void requestDeviceSwitchStatus() {

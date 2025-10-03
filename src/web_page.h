@@ -1,4 +1,5 @@
 #pragma once
+#include <Arduino.h>
 
 const char PAGE_HTML[] PROGMEM = R"=====(
 <!DOCTYPE html>
