@@ -90,8 +90,6 @@ const char PAGE_HTML[] PROGMEM = R"=====(
         .modal-header { padding-bottom: 10px; border-bottom: 1px solid #495057; margin-bottom: 15px; }
         .modal-header h5 { margin: 0; font-weight: bold; }
         .modal-footer { padding-top: 10px; border-top: 1px solid #495057; margin-top: 15px; text-align: right; }
-        .close-button { color: #aaa; float: right; font-size: 28px; font-weight: bold; }
-        .close-button:hover, .close-button:focus { color: #fff; text-decoration: none; cursor: pointer; }
         .form-group { margin-bottom: 1rem; }
         .table, .table th, .table td { border: 1px solid #495057; } /* Table borders */
         .table th, .table td { padding: 0.5rem; } /* Table cell padding */
@@ -122,7 +120,6 @@ const char PAGE_HTML[] PROGMEM = R"=====(
             <div class="modal-content">
                 <div class="modal-header">
                     <h5 id="rfMappingModalTitle">Add RF Mapping</h5>
-                    <span class="close-button" onclick="closeRfMappingModal()">&times;</span>
                 </div>
                 <form id="rfMappingForm">
                     <input type="hidden" id="rfMappingIndex" name="rfMappingIndex" value="-1">
