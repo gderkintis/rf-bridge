@@ -3,7 +3,7 @@
 #include <ESP8266WiFi.h>
 #include <ESP8266HTTPClient.h>
 #include <WiFiClientSecure.h>
-#include <EEPROM.h>
+#include <LittleFS.h>
 #include <ELECHOUSE_CC1101_SRC_DRV.h>
 #include <ESP8266WebServer.h> 
 #include <WebSocketsServer.h>
@@ -62,7 +62,8 @@ const int RPC_CMD_TIMEOUT_STATUS_CODE = -100; // Special timeout command
 // --- Globals for RF Action Mappings ---
 int learnModeForMappingIndex = -1; // -1 if not in learn mode, otherwise index of mapping being learned
 unsigned long learnModeStartTime = 0; // Timestamp for learn mode activation
-const unsigned long LEARN_MODE_TIMEOUT_MS = 30000; // 30 seconds for learn mode timeout
+const unsigned long LEARN_MODE_TIMEOUT_MS = 30000;
+#define MAX_SUPPORTED_RF_MAPPINGS 100 // Increased from 9 now that we use LittleFS
 
 // --- New RF Action Mapping Structures ---
 #define MAX_URL_LEN 64       // Max length for URLs
@@ -118,40 +119,9 @@ struct RfActionMapping {
 std::vector<RfActionMapping> rfActionMappings; // Dynamic list of mappings
 uint16_t nextRfMappingId = 1; // Counter for unique RF Mapping IDs
 
-// --- EEPROM Configuration --- //
-#define EEPROM_SIZE 4096 // Using 4KB EEPROM size
-
-// RF Action Mappings Storage
-#define MAX_SUPPORTED_RF_MAPPINGS 9    // Max RF mappings with 4KB EEPROM and 2 HTTP steps per mapping
-#define RF_MAPPINGS_STORED_FLAG_ADDR 0 // Start address for the magic byte
-#define RF_MAPPINGS_STORED_MAGIC_BYTE 0xB6 // Magic byte for stored mappings array
-#define NEXT_RF_MAPPING_ID_EEPROM_ADDR (RF_MAPPINGS_STORED_FLAG_ADDR + sizeof(byte))
-#define NUM_RF_MAPPINGS_EEPROM_ADDR (NEXT_RF_MAPPING_ID_EEPROM_ADDR + sizeof(uint16_t))
-#define RF_MAPPINGS_DATA_START_ADDR (NUM_RF_MAPPINGS_EEPROM_ADDR + sizeof(uint16_t)) // Where actual mapping structs start
-
-// General Configuration Storage
-#define WIFI_SSID_MAX_LEN 32
-#define WIFI_PASS_MAX_LEN 64
-#define IP_MAX_LEN 16
-#define GENERAL_CONFIG_START_ADDR 3820 
-#define CONFIG_STORED_MAGIC_BYTE 0xC7 // A magic byte for general config
-#define WIFI_SSID_EEPROM_ADDR (CONFIG_STORED_FLAG_ADDR + sizeof(byte))
-#define WIFI_PASS_EEPROM_ADDR (WIFI_SSID_EEPROM_ADDR + WIFI_SSID_MAX_LEN + 1) // +1 for null terminator
-
-// CC1101 Configuration Storage
-#define CONFIG_STORED_FLAG_ADDR GENERAL_CONFIG_START_ADDR // The flag for general config
-#define WIFI_SSID_EEPROM_ADDR (CONFIG_STORED_FLAG_ADDR + sizeof(byte))
-#define WIFI_PASS_EEPROM_ADDR (WIFI_SSID_EEPROM_ADDR + WIFI_SSID_MAX_LEN + 1)
-#define CC1101_FREQ_EEPROM_ADDR (WIFI_PASS_EEPROM_ADDR + WIFI_PASS_MAX_LEN + 1)
-#define CC1101_BANDWIDTH_EEPROM_ADDR (CC1101_FREQ_EEPROM_ADDR + sizeof(float))
-#define CC1101_RATE_EEPROM_ADDR (CC1101_BANDWIDTH_EEPROM_ADDR + sizeof(float))
-#define EEPROM_REBOOT_FLAG_ADDR (CC1101_RATE_EEPROM_ADDR + sizeof(float))
-const byte REBOOT_FLAG_MAGIC_BYTE = 0xD7; // Magic byte for the EEPROM reboot flag
-// --- End EEPROM Configuration ---
-
 // --- Global Variables ---
-void loadRfMappingsFromEEPROM();
-bool saveRfMappingsToEEPROM();
+void loadRfMappingsFromFS();
+bool saveRfMappingsToFS();
 void handleSerialCommands();
 void printHelp();
 void initialize_cc1101();
@@ -186,18 +156,19 @@ void setup() {
   initialize_cc1101(); // Initialize CC1101 for reception
   mySwitch.enableReceive(RF_DATA_PIN);
 
-  // Initialize EEPROM and load settings
-  Serial.println("Initializing EEPROM...");
-  EEPROM.begin(EEPROM_SIZE);
-
-  // Check for client-initiated reboot flag
-  if (EEPROM.read(EEPROM_REBOOT_FLAG_ADDR) == REBOOT_FLAG_MAGIC_BYTE) {
-    g_justRebootedFromClientCommand = true;
-    EEPROM.write(EEPROM_REBOOT_FLAG_ADDR, 0x00);
-    EEPROM.commit();
+  // Initialize LittleFS and load settings
+  Serial.println("Initializing LittleFS...");
+  if (!LittleFS.begin()) {
+    Serial.println("LittleFS Mount Failed");
   }
 
-  loadRfMappingsFromEEPROM();
+  // Check for client-initiated reboot flag
+  if (LittleFS.exists("/reboot.flag")) {
+    g_justRebootedFromClientCommand = true;
+    LittleFS.remove("/reboot.flag");
+  }
+
+  loadRfMappingsFromFS();
 
   // --- WiFi Setup ---
   WiFi.mode(WIFI_STA);
@@ -259,12 +230,8 @@ void setup() {
 
     if (rebootAfterResponse) {
       Serial.println("OTA Update successful. Rebooting after sending client response.");
-      EEPROM.write(EEPROM_REBOOT_FLAG_ADDR, REBOOT_FLAG_MAGIC_BYTE);
-      if (EEPROM.commit()) {
-          // Serial.println("Reboot flag set and EEPROM committed (OTA)."); // DEBUG
-      } else {
-      }
-      delay(50); // Brief delay for EEPROM commit
+      File f = LittleFS.open("/reboot.flag", "w");
+      f.close();
 
       Serial.println("OTA: Attempting to gracefully disconnect WebSocket clients before reboot...");
       const uint8_t maxClients = 4;
@@ -492,132 +459,108 @@ void initialize_cc1101() {
 }
 
 bool loadConfiguration() {
-  if (EEPROM.read(CONFIG_STORED_FLAG_ADDR) == CONFIG_STORED_MAGIC_BYTE) {
-    char ssid_buffer[WIFI_SSID_MAX_LEN + 1];
-    char pass_buffer[WIFI_PASS_MAX_LEN + 1];
-
-    for (int i = 0; i <= WIFI_SSID_MAX_LEN; ++i) {
-      ssid_buffer[i] = EEPROM.read(WIFI_SSID_EEPROM_ADDR + i);
-    }
-    ssid_buffer[WIFI_SSID_MAX_LEN] = '\0'; // Ensure null termination
-    for (int i = 0; i <= WIFI_PASS_MAX_LEN; ++i) {
-      pass_buffer[i] = EEPROM.read(WIFI_PASS_EEPROM_ADDR + i);
-    }
-    pass_buffer[WIFI_PASS_MAX_LEN] = '\0'; // Ensure null termination
-
-    currentSSID = String(ssid_buffer);
-    currentPassword = String(pass_buffer);
-
-    // Load CC1101 settings
-    EEPROM.get(CC1101_FREQ_EEPROM_ADDR, currentFrequency);
-    EEPROM.get(CC1101_BANDWIDTH_EEPROM_ADDR, currentBandwidth);
-    EEPROM.get(CC1101_RATE_EEPROM_ADDR, currentDataRate);
-
-    // Validate loaded CC1101 settings and revert to defaults if invalid
-    if (!(currentFrequency >= 387.000f && currentFrequency <= 464.000f)) { // Also catches NaN
-        Serial.print("Warning: Loaded CC1101 frequency ("); Serial.print(currentFrequency);
-        Serial.println(") is invalid/out of range. Resetting to 433.92 MHz.");
-        currentFrequency = 433.92f;
-    }
-
-    bool validLoadedBandwidth = false;
-    // Note: currentBandwidth is a float, but represents discrete KHz values.
-    // We compare it against the known allowed integer values.
-    int allowedBandwidths[] = {58, 67, 81, 101, 116, 135, 162, 203, 232, 270, 325, 406, 464, 541, 650, 812};
-    for (int bw_val : allowedBandwidths) {
-        // Using a small tolerance for float comparison, though direct comparison might work
-        // if values were saved precisely.
-        if (abs(currentBandwidth - (float)bw_val) < 0.01f) {
-            validLoadedBandwidth = true;
-            break;
-        }
-    }
-    if (!validLoadedBandwidth) {
-        Serial.print("Warning: Loaded CC1101 Bandwidth ("); Serial.print(currentBandwidth);
-        Serial.println(") is invalid. Resetting to 101 KHz.");
-        currentBandwidth = 101.0f;
-    }
-
-    if (!(currentDataRate >= 0.6f && currentDataRate <= 600.0f)) { // Also catches NaN
-        Serial.print("Warning: Loaded CC1101 data rate ("); Serial.print(currentDataRate);
-        Serial.println(") is invalid/out of range. Resetting to 2.5 kBaud.");
-        currentDataRate = 2.5f;
-    }
-
-    Serial.println("Configuration loaded from EEPROM.");
-    Serial.print("  Loaded SSID: "); Serial.println(currentSSID);
-    Serial.print("  Loaded CC1101 Freq: "); Serial.print(currentFrequency, 3); Serial.println(" MHz");    Serial.print("  Loaded CC1101 Bandwidth: "); Serial.print(currentBandwidth, 0); Serial.println(" KHz");    Serial.print("  Loaded CC1101 Data Rate: "); Serial.print(currentDataRate, 1); Serial.println(" kBaud"); return true;
+  File file = LittleFS.open("/config.json", "r");
+  if (!file) {
+    Serial.println("No configuration file found.");
+    return false;
   }
-  Serial.println("No configuration found in EEPROM.");
-  return false;
+  JsonDocument doc;
+  DeserializationError error = deserializeJson(doc, file);
+  file.close();
+  if (error) return false;
+
+  currentSSID = doc["ssid"] | "";
+  currentPassword = doc["pass"] | "";
+  currentFrequency = doc["freq"] | 433.92f;
+  currentBandwidth = doc["bw"] | 101.0f;
+  currentDataRate = doc["rate"] | 2.5f;
+  nextRfMappingId = doc["next_id"] | 1;
+
+  // Validate settings
+  if (!(currentFrequency >= 387.000f && currentFrequency <= 464.000f)) currentFrequency = 433.92f;
+  if (!(currentDataRate >= 0.6f && currentDataRate <= 600.0f)) currentDataRate = 2.5f;
+
+  Serial.println("Configuration loaded from LittleFS.");
+  return true;
 }
 
 void saveConfiguration() {
-  Serial.println("Saving configuration to EEPROM...");
-  for (unsigned int i = 0; i < WIFI_SSID_MAX_LEN; ++i) {
-    EEPROM.write(WIFI_SSID_EEPROM_ADDR + i, (i < currentSSID.length()) ? currentSSID.charAt(i) : 0);
-  }
-  EEPROM.write(WIFI_SSID_EEPROM_ADDR + WIFI_SSID_MAX_LEN, 0); // Null terminator
+  Serial.println("Saving configuration to LittleFS...");
+  File file = LittleFS.open("/config.json", "w");
+  if (!file) return;
 
-  for (unsigned int i = 0; i < WIFI_PASS_MAX_LEN; ++i) {
-    EEPROM.write(WIFI_PASS_EEPROM_ADDR + i, (i < currentPassword.length()) ? currentPassword.charAt(i) : 0);
-  }
-  EEPROM.write(WIFI_PASS_EEPROM_ADDR + WIFI_PASS_MAX_LEN, 0); // Null terminator
+  JsonDocument doc;
+  doc["ssid"] = currentSSID;
+  doc["pass"] = currentPassword;
+  doc["freq"] = currentFrequency;
+  doc["bw"] = currentBandwidth;
+  doc["rate"] = currentDataRate;
+  doc["next_id"] = nextRfMappingId;
 
-  // Save CC1101 settings
-  EEPROM.put(CC1101_FREQ_EEPROM_ADDR, currentFrequency);
-  EEPROM.put(CC1101_BANDWIDTH_EEPROM_ADDR, currentBandwidth);
-  EEPROM.put(CC1101_RATE_EEPROM_ADDR, currentDataRate);
-
-  EEPROM.write(CONFIG_STORED_FLAG_ADDR, CONFIG_STORED_MAGIC_BYTE);
-
-  if (EEPROM.commit()) {
-    Serial.println("Configuration saved successfully.");
-  } else {
-    Serial.println("Error saving configuration to EEPROM.");
-  }
+  serializeJson(doc, file);
+  file.close();
 }
 
-void loadRfMappingsFromEEPROM() {
-  byte flag = EEPROM.read(RF_MAPPINGS_STORED_FLAG_ADDR);
-  rfActionMappings.clear(); // Clear existing vector
+void loadRfMappingsFromFS() {
+  rfActionMappings.clear();
+  File file = LittleFS.open("/mappings.json", "r");
+  if (!file) return;
 
-  if (flag == RF_MAPPINGS_STORED_MAGIC_BYTE) {
-    EEPROM.get(NEXT_RF_MAPPING_ID_EEPROM_ADDR, nextRfMappingId);
-    uint16_t numMappingsStored = 0;
-    EEPROM.get(NUM_RF_MAPPINGS_EEPROM_ADDR, numMappingsStored);
+  JsonDocument doc;
+  DeserializationError error = deserializeJson(doc, file);
+  file.close();
+  if (error) return;
 
-    Serial.printf("Found %u RF Action Mappings in EEPROM. Next ID: %u\n", numMappingsStored, nextRfMappingId);
-    rfActionMappings.reserve(numMappingsStored); // Pre-allocate memory
-
-    for (uint16_t i = 0; i < numMappingsStored; ++i) {
-      RfActionMapping mapping;
-      EEPROM.get(RF_MAPPINGS_DATA_START_ADDR + (i * sizeof(RfActionMapping)), mapping);
-      rfActionMappings.push_back(mapping);
+  JsonArray array = doc.as<JsonArray>();
+  for (JsonObject obj : array) {
+    RfActionMapping m;
+    m.id = obj["id"];
+    m.rfCode = obj["rf"];
+    m.actionType = (ActionType)obj["type"].as<int>();
+    strncpy(m.RPC_IP, obj["rpc_ip"] | "", IP_MAX_LEN - 1);
+    m.RPC_SwitchId = obj["rpc_sid"];
+    m.enabled = obj["enabled"];
+    JsonArray steps = obj["steps"];
+    m.numHttpSteps = 0;
+    for (JsonObject s : steps) {
+      if (m.numHttpSteps >= MAX_HTTP_STEPS_PER_MAPPING) break;
+      m.httpSteps[m.numHttpSteps].method = (HttpMethod)s["m"].as<int>();
+      strncpy(m.httpSteps[m.numHttpSteps].url, s["u"] | "", MAX_URL_LEN - 1);
+      strncpy(m.httpSteps[m.numHttpSteps].headers, s["h"] | "", MAX_HEADERS_LEN - 1);
+      strncpy(m.httpSteps[m.numHttpSteps].jsonData, s["d"] | "", MAX_JSON_DATA_LEN - 1);
+      m.numHttpSteps++;
     }
-    Serial.println("Finished loading RF Action Mappings from EEPROM.");
-  } else {
-    Serial.println("No RF Action Mappings found in EEPROM, or EEPROM uninitialized.");
-    // Vector is already empty.
-    nextRfMappingId = 1; // Reset ID counter if no mappings found
+    rfActionMappings.push_back(m);
   }
+  Serial.printf("Loaded %u mappings from LittleFS.\n", rfActionMappings.size());
 }
 
-bool saveRfMappingsToEEPROM() {
-  EEPROM.write(RF_MAPPINGS_STORED_FLAG_ADDR, RF_MAPPINGS_STORED_MAGIC_BYTE);
-  EEPROM.put(NEXT_RF_MAPPING_ID_EEPROM_ADDR, nextRfMappingId);
-  EEPROM.put(NUM_RF_MAPPINGS_EEPROM_ADDR, (uint16_t)rfActionMappings.size());
-  for (uint16_t i = 0; i < rfActionMappings.size(); ++i) {
-    EEPROM.put(RF_MAPPINGS_DATA_START_ADDR + (i * sizeof(RfActionMapping)), rfActionMappings[i]);
-  }
+bool saveRfMappingsToFS() {
+  File file = LittleFS.open("/mappings.json", "w");
+  if (!file) return false;
 
-  if (EEPROM.commit()) {
-    Serial.println("Successfully saved RF Action Mappings and config to EEPROM.");
-    return true;
-  } else {
-    Serial.println("Error saving RF Action Mappings to EEPROM.");
-    return false;
+  JsonDocument doc;
+  JsonArray array = doc.to<JsonArray>();
+  for (const auto& mapping : rfActionMappings) {
+    JsonObject obj = array.add<JsonObject>();
+    obj["id"] = mapping.id;
+    obj["rf"] = mapping.rfCode;
+    obj["type"] = (int)mapping.actionType;
+    obj["rpc_ip"] = mapping.RPC_IP;
+    obj["rpc_sid"] = mapping.RPC_SwitchId;
+    obj["enabled"] = mapping.enabled;
+    JsonArray steps = obj["steps"].to<JsonArray>();
+    for (int j = 0; j < mapping.numHttpSteps; j++) {
+      JsonObject s = steps.add<JsonObject>();
+      s["m"] = (int)mapping.httpSteps[j].method;
+      s["u"] = mapping.httpSteps[j].url;
+      s["h"] = mapping.httpSteps[j].headers;
+      s["d"] = mapping.httpSteps[j].jsonData;
+    }
   }
+  serializeJson(doc, file);
+  file.close();
+  return true;
 }
 
 void parseAndAddHeader(HTTPClient& http, const char* headerLine) {
@@ -1100,7 +1043,7 @@ void loop() {
           if (rfActionMappings[i].id == (uint16_t)learnModeForMappingIndex) {
             rfActionMappings[i].rfCode = receivedCode;
             // rfActionMappings[i].enabled = true; // Do not auto-enable
-            if (saveRfMappingsToEEPROM()) {
+            if (saveRfMappingsToFS()) {
                 Serial.printf("LEARN MODE DEACTIVATED. New code %lu saved to mapping ID %d.\n", receivedCode, learnModeForMappingIndex);
                 broadcastAlert("rfControlPane", "New RF Code (" + String(receivedCode) + ") learned for mapping ID " + String(learnModeForMappingIndex) + " and saved!", "success", 5000);
             } else {
@@ -1495,7 +1438,7 @@ void handleWebSocketCommand(uint8_t clientNum, const char* action, JsonObject& p
             if (newIdToAssign >= nextRfMappingId) { nextRfMappingId = newIdToAssign + 1; }
         }
 
-        if (saveRfMappingsToEEPROM()) {
+        if (saveRfMappingsToFS()) {
             Serial.printf("Mapping ID %d %s successfully.\n", mapping_id, isEdit ? "edited" : "added");
             broadcastAlert("rfControlPane", "Mapping ID " + String(mapping_id) + (isEdit ? " edited." : " added."), "success", 3000);
             broadcastStatusUpdate();
@@ -1516,7 +1459,7 @@ void handleWebSocketCommand(uint8_t clientNum, const char* action, JsonObject& p
             }
         }
         if (deleted) {
-             if (saveRfMappingsToEEPROM()) {
+             if (saveRfMappingsToFS()) {
                 Serial.printf("Mapping ID %u deleted successfully.\n", id_to_delete);
                 broadcastAlert("rfControlPane", "Mapping ID " + String(id_to_delete) + " deleted.", "success", 3000);
                 broadcastStatusUpdate();
@@ -1535,7 +1478,7 @@ void handleWebSocketCommand(uint8_t clientNum, const char* action, JsonObject& p
         for (size_t i = 0; i < rfActionMappings.size(); ++i) {
             if (rfActionMappings[i].id == mapping_id_to_toggle) {
                 rfActionMappings[i].enabled = !rfActionMappings[i].enabled;
-                if (saveRfMappingsToEEPROM()) {
+                if (saveRfMappingsToFS()) {
                     Serial.printf("Mapping ID %u enabled state toggled to: %s\n", mapping_id_to_toggle, rfActionMappings[i].enabled ? "Enabled" : "Disabled");
                     broadcastAlert("rfControlPane", "Mapping ID " + String(mapping_id_to_toggle) + " is now " + (rfActionMappings[i].enabled ? "Enabled." : "Disabled."), "success", 3000);
                     broadcastStatusUpdate();
@@ -1683,12 +1626,8 @@ void handleWebSocketCommand(uint8_t clientNum, const char* action, JsonObject& p
             delay(20);
         }
 
-        EEPROM.write(EEPROM_REBOOT_FLAG_ADDR, REBOOT_FLAG_MAGIC_BYTE);
-        if (EEPROM.commit()) {
-        } else {
-            Serial.println("Error committing EEPROM for reboot flag. Rebooting anyway.");
-        }
-        delay(50); 
+        File f = LittleFS.open("/reboot.flag", "w");
+        f.close();
 
         Serial.println("Proceeding with ESP.restart() after a final delay.");
         delay(1000); // Original delay, also allows clients to process the close frame
