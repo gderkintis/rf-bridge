@@ -767,7 +767,7 @@ function createHttpStepFields(stepNum, stepData = {}) {
 function addHttpStepField(stepData = null, isInitialEmptyStep = false) {
     const container = document.getElementById('httpStepFieldsContainer');
     const existingSteps = container.querySelectorAll('.http-step').length;
-    const maxSteps = 2; // From your MAX_HTTP_STEPS_PER_MAPPING
+    const maxSteps = 5; // From your MAX_HTTP_STEPS_PER_MAPPING
 
     if (existingSteps >= maxSteps) {
         showPaneAlert('rfControlPane', `Maximum ${maxSteps} HTTP steps allowed.`, 'warning', 3000);
@@ -791,7 +791,7 @@ function updateAddHttpStepButtonVisibility() {
     const container = document.getElementById('httpStepFieldsContainer');
     const addBtn = document.getElementById('addHttpStepBtn');
     const existingSteps = container.querySelectorAll('.http-step').length;
-    const maxSteps = 2; // From MAX_HTTP_STEPS_PER_MAPPING
+    const maxSteps = 5; // From MAX_HTTP_STEPS_PER_MAPPING
 
     if (existingSteps >= maxSteps) {
         addBtn.style.display = 'none';

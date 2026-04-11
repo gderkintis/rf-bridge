@@ -13,7 +13,7 @@ The entire system is configured through a responsive web interface, with all set
 - **RF Code Learning:** Capture and assign RF codes to actions directly from the interface.
 - **Powerful Actions:**
   - **HTTP/HTTPS Requests:** Trigger GET or POST requests to any webhook or API endpoint.
-  - **Chained HTTP Requests:** Execute a sequence of up to 2 HTTP requests for a single RF code.
+  - **Chained HTTP Requests:** Execute a sequence of up to 5 HTTP requests for a single RF code.
   - **Shelly RPC Control:** Natively control Shelly devices (Gen2/Plus/Pro) with Toggle, On, and Off commands.
 - **Web Interface:** Modern, responsive, and real-time UI for configuration and control.
   - Built-in status dashboard.

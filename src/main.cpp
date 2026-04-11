@@ -63,13 +63,13 @@ const int RPC_CMD_TIMEOUT_STATUS_CODE = -100; // Special timeout command
 int learnModeForMappingIndex = -1; // -1 if not in learn mode, otherwise index of mapping being learned
 unsigned long learnModeStartTime = 0; // Timestamp for learn mode activation
 const unsigned long LEARN_MODE_TIMEOUT_MS = 30000;
-#define MAX_SUPPORTED_RF_MAPPINGS 100
+#define MAX_SUPPORTED_RF_MAPPINGS 25
 
 // --- New RF Action Mapping Structures ---
 #define MAX_URL_LEN 64       // Max length for URLs
 #define MAX_HEADERS_LEN 64   // Max length for HTTP POST headers (e.g., "Content-Type: application/json")
 #define MAX_JSON_DATA_LEN 64 // Max length for HTTP POST JSON data (e.g., {"value":1})
-#define MAX_HTTP_STEPS_PER_MAPPING 2 // Max number of HTTP commands in a chain for one mapping
+#define MAX_HTTP_STEPS_PER_MAPPING 5 // Max number of HTTP commands in a chain for one mapping
 
 // Define IP_MAX_LEN before it's used in RfActionMapping struct and other places
 #define IP_MAX_LEN 16 // For "xxx.xxx.xxx.xxx\0"
@@ -1400,8 +1400,12 @@ void handleWebSocketCommand(uint8_t clientNum, const char* action, JsonObject& p
                 }
             }
 
-            RfActionMapping newMapping;
-            newMapping.id = newIdToAssign; 
+            // Use emplace_back to create the mapping directly in the vector's heap memory
+            // instead of the stack, avoiding a 1KB stack allocation that causes crashes.
+            rfActionMappings.emplace_back();
+            RfActionMapping& newMapping = rfActionMappings.back();
+
+            newMapping.id = newIdToAssign;
             // Explicitly set actionType from payload, with a check
             if (payload["action_type"].is<int>()) {
                 newMapping.actionType = (ActionType)payload["action_type"].as<int>();
@@ -1418,17 +1422,15 @@ void handleWebSocketCommand(uint8_t clientNum, const char* action, JsonObject& p
             newMapping.numHttpSteps = 0;
             if (payload["http_steps"].is<JsonArray>()) {
                 JsonArray stepsArray = payload["http_steps"].as<JsonArray>();
-                uint8_t stepCount = 0;
                 for (JsonVariant step_v : stepsArray) {
-                    if (stepCount >= MAX_HTTP_STEPS_PER_MAPPING) break;
+                    if (newMapping.numHttpSteps >= MAX_HTTP_STEPS_PER_MAPPING) break;
                     JsonObject stepObj = step_v.as<JsonObject>();
-                    newMapping.httpSteps[stepCount].method = (HttpMethod)stepObj["method"].as<int>();
-                    strncpy(newMapping.httpSteps[stepCount].url, stepObj["url"].as<const char*>(), MAX_URL_LEN -1); newMapping.httpSteps[stepCount].url[MAX_URL_LEN-1] = '\0';
-                    strncpy(newMapping.httpSteps[stepCount].headers, stepObj["headers"].as<const char*>(), MAX_HEADERS_LEN -1); newMapping.httpSteps[stepCount].headers[MAX_HEADERS_LEN-1] = '\0';
-                    strncpy(newMapping.httpSteps[stepCount].jsonData, stepObj["jsonData"].as<const char*>(), MAX_JSON_DATA_LEN -1); newMapping.httpSteps[stepCount].jsonData[MAX_JSON_DATA_LEN-1] = '\0';
-                    stepCount++;
+                    newMapping.httpSteps[newMapping.numHttpSteps].method = (HttpMethod)stepObj["method"].as<int>();
+                    strncpy(newMapping.httpSteps[newMapping.numHttpSteps].url, stepObj["url"].as<const char*>(), MAX_URL_LEN -1); newMapping.httpSteps[newMapping.numHttpSteps].url[MAX_URL_LEN-1] = '\0';
+                    strncpy(newMapping.httpSteps[newMapping.numHttpSteps].headers, stepObj["headers"].as<const char*>(), MAX_HEADERS_LEN -1); newMapping.httpSteps[newMapping.numHttpSteps].headers[MAX_HEADERS_LEN-1] = '\0';
+                    strncpy(newMapping.httpSteps[newMapping.numHttpSteps].jsonData, stepObj["jsonData"].as<const char*>(), MAX_JSON_DATA_LEN -1); newMapping.httpSteps[newMapping.numHttpSteps].jsonData[MAX_JSON_DATA_LEN-1] = '\0';
+                    newMapping.numHttpSteps++;
                 }
-                newMapping.numHttpSteps = stepCount;
             }
 
             if (payload["enabled"].is<bool>()) { // If client sends it (e.g. for add)
@@ -1436,7 +1438,6 @@ void handleWebSocketCommand(uint8_t clientNum, const char* action, JsonObject& p
             } else { // Default for add if not provided
                 newMapping.enabled = true; 
             }
-            rfActionMappings.push_back(newMapping);
             mapping_id = newMapping.id; // For the alert message
 
             if (newIdToAssign >= nextRfMappingId) { nextRfMappingId = newIdToAssign + 1; }
