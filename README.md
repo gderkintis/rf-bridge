@@ -2,7 +2,7 @@
 
 An advanced and configurable RF-to-Network bridge running on an ESP8266. This project receives 433MHz RF signals (from remote controls, sensors, etc.) and triggers complex, user-defined actions like HTTP/HTTPS requests or commands to smart home devices.
 
-The entire system is configured through a responsive web interface, with all settings saved to the ESP8266's internal EEPROM.
+The entire system is configured through a responsive web interface, with all settings saved to the ESP8266's internal Flash memory using the LittleFS file system.
 
 ![Web UI Screenshot](./docs/web-ui.png)
 
@@ -20,7 +20,7 @@ The entire system is configured through a responsive web interface, with all set
   - CC1101 parameter configuration (Frequency, Bandwidth, Data Rate).
   - Over-the-Air (OTA) firmware updates.
 - **Real-time Updates:** Uses WebSockets to provide instant status updates to the UI without needing to refresh the page.
-- **Persistent Storage:** All WiFi credentials and RF mappings are saved to EEPROM, surviving reboots.
+- **Persistent Storage:** All WiFi credentials and RF mappings are saved to LittleFS as JSON files, surviving reboots and providing better reliability and scalability than traditional EEPROM.
 - **Serial Console:** A command-line interface for debugging and manual control.
 
 ## Hardware Requirements
