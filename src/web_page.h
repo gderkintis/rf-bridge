@@ -523,8 +523,8 @@ function _renderSingleMappingCard(mapping) {
 
     let paramsHtml = '';
     if (mapping.action_type >= 1 && mapping.action_type <= 3) { // RPC actions
-        paramsHtml = `<div class="mb-1"><strong>RPC IP:</strong> ${mapping.RPC_ip || '<span class="text-muted">Not Set</span>'}</div>
-                      <div><strong>RPC ID:</strong> ${mapping.RPC_switch_id}</div>`;
+        paramsHtml = `<div class="mb-1"><strong>RPC IP:</strong> ${mapping.RPC_IP || '<span class="text-muted">Not Set</span>'}</div>
+                      <div><strong>RPC ID:</strong> ${mapping.RPC_SwitchId}</div>`;
     } else if (mapping.action_type === 4) { // ACTION_HTTP
         for (let k = 0; k < mapping.num_http_steps; k++) {
             const step = mapping.http_steps[k];
@@ -664,9 +664,9 @@ function openRfMappingModal(index = -1, mapping = null) {
         document.getElementById('rfActionType').value = '1'; // Default to "RPC Toggle"
     } else { // Edit mode
         title.textContent = `Edit RF Mapping (ID: ${index})`;
-        document.getElementById('rfRPC_IP').value = mapping.RPC_IP || ''; // Populate RPC IP
+        document.getElementById('rfRPC_IP').value = mapping.RPC_IP || '';
         document.getElementById('rfActionType').value = mapping.action_type;
-        document.getElementById('rfRPC_SwitchId').value = mapping.RPC_switch_id || 0;
+        document.getElementById('rfRPC_SwitchId').value = mapping.RPC_SwitchId || 0;
 
         if (mapping.action_type === 4 && mapping.http_steps && mapping.http_steps.length > 0) {
             mapping.http_steps.forEach(stepData => {

@@ -63,7 +63,7 @@ const int RPC_CMD_TIMEOUT_STATUS_CODE = -100; // Special timeout command
 int learnModeForMappingIndex = -1; // -1 if not in learn mode, otherwise index of mapping being learned
 unsigned long learnModeStartTime = 0; // Timestamp for learn mode activation
 const unsigned long LEARN_MODE_TIMEOUT_MS = 30000;
-#define MAX_SUPPORTED_RF_MAPPINGS 100 // Increased from 9 now that we use LittleFS
+#define MAX_SUPPORTED_RF_MAPPINGS 100
 
 // --- New RF Action Mapping Structures ---
 #define MAX_URL_LEN 64       // Max length for URLs
@@ -946,8 +946,8 @@ void sendFullStatusToClient(uint8_t clientNum) {
     jsonPayload += "\"id\":" + String(mapping.id) + ","; 
     jsonPayload += "\"rf_code\":" + String(mapping.rfCode) + ",";
     jsonPayload += "\"action_type\":" + String((int)mapping.actionType) + ",";
-    jsonPayload += "\"RPC_ip\":\"" + escapeJsonString(String(mapping.RPC_IP)) + "\",";
-    jsonPayload += "\"RPC_switch_id\":" + String(mapping.RPC_SwitchId) + ",";
+    jsonPayload += "\"RPC_IP\":\"" + escapeJsonString(String(mapping.RPC_IP)) + "\",";
+    jsonPayload += "\"RPC_SwitchId\":" + String(mapping.RPC_SwitchId) + ",";
     jsonPayload += "\"num_http_steps\":" + String(mapping.numHttpSteps) + ",";
     jsonPayload += "\"http_steps\":["; // Start of http_steps array
     for (uint8_t j = 0; j < mapping.numHttpSteps && j < MAX_HTTP_STEPS_PER_MAPPING; ++j) {
@@ -1409,6 +1409,10 @@ void handleWebSocketCommand(uint8_t clientNum, const char* action, JsonObject& p
                 newMapping.actionType = ACTION_NONE; // Fallback, though payload should always have it
                 Serial.println("Warning: 'action_type' missing or not an int in addRfMapping payload.");
             }
+
+            strncpy(newMapping.RPC_IP, payload["RPC_IP"] | "", IP_MAX_LEN - 1);
+            newMapping.RPC_IP[IP_MAX_LEN - 1] = '\0';
+            newMapping.RPC_SwitchId = payload["RPC_SwitchId"] | 0;
             newMapping.rfCode = 0; // Learned separately
             
             newMapping.numHttpSteps = 0;
