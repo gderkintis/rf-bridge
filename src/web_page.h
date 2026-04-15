@@ -848,6 +848,7 @@ function toggleRfMappingFormFields() {
 
     RPC_IpGroup.style.display = 'none';
     RPC_IdGroup.style.display = 'none';
+    httpStepFieldsContainer.style.display = 'none';
     
     addHttpStepBtn.style.display = 'none';
 
@@ -859,6 +860,7 @@ function toggleRfMappingFormFields() {
             RPC_IdGroup.style.display = 'block';
             break;
         case '4': // HTTP Request
+            httpStepFieldsContainer.style.display = 'block';
             if (httpStepFieldsContainer.children.length === 0) {
                 addHttpStepField(null, true);
             }
