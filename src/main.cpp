@@ -609,9 +609,9 @@ void loadRfMappingsFromFS() {
     for (JsonObject s : steps) {
       if (m.numHttpSteps >= MAX_HTTP_STEPS_PER_MAPPING) break;
       m.httpSteps[m.numHttpSteps].method = (HttpMethod)s["m"].as<int>();
-      strncpy(m.httpSteps[m.numHttpSteps].url, s["u"] | "", MAX_URL_LEN - 1);
-      strncpy(m.httpSteps[m.numHttpSteps].headers, s["h"] | "", MAX_HEADERS_LEN - 1);
-      strncpy(m.httpSteps[m.numHttpSteps].jsonData, s["d"] | "", MAX_JSON_DATA_LEN - 1);
+      strncpy(m.httpSteps[m.numHttpSteps].url, s["url"] | "", MAX_URL_LEN - 1);
+      strncpy(m.httpSteps[m.numHttpSteps].headers, s["headers"] | "", MAX_HEADERS_LEN - 1);
+      strncpy(m.httpSteps[m.numHttpSteps].jsonData, s["jsonData"] | "", MAX_JSON_DATA_LEN - 1);
       m.numHttpSteps++;
     }
     rfActionMappings.push_back(m);
@@ -636,10 +636,10 @@ bool saveRfMappingsToFS() {
     JsonArray steps = obj["http_request_chain"].to<JsonArray>();
     for (int j = 0; j < mapping.numHttpSteps; j++) {
       JsonObject s = steps.add<JsonObject>();
-      s["m"] = (int)mapping.httpSteps[j].method;
-      s["u"] = mapping.httpSteps[j].url;
-      s["h"] = mapping.httpSteps[j].headers;
-      s["d"] = mapping.httpSteps[j].jsonData;
+      s["method"] = (int)mapping.httpSteps[j].method;
+      s["url"] = mapping.httpSteps[j].url;
+      s["headers"] = mapping.httpSteps[j].headers;
+      s["jsonData"] = mapping.httpSteps[j].jsonData;
     }
   }
   serializeJson(doc, file);
