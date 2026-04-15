@@ -27,11 +27,13 @@ String otaUpdateMessage = "";
 RCSwitch mySwitch = RCSwitch();
 ESP8266WebServer server(80);
 WebSocketsServer webSocket = WebSocketsServer(81);
-WebSocketsClient RPC;
 
 // --- Configuration ---
 String currentSSID = "";
 String currentPassword = "";
+
+// Define IP_MAX_LEN before it's used in RpcConnection and other places
+#define IP_MAX_LEN 16 // For "xxx.xxx.xxx.xxx\0"
 
 const int RF_DATA_PIN = D1;
 
@@ -41,15 +43,20 @@ float currentDataRate = 2.8;
 float currentBandwidth = 203;
 String currentCC1101Mode = "RX";
 
-// --- RPC Globals ---
-bool isDeviceConnected = false;
-unsigned long lastDeviceAttempt = 0;
-const unsigned long RPC_RECONNECT_INTERVAL_NORMAL = 10000; // 10 seconds
-unsigned long lastRPCPingSent = 0;
-const unsigned long RPC_PING_INTERVAL = 30000; // Send a PING every 30 seconds
-unsigned int DeviceMsgId = 1; // For uniquely identifying RPC messages
-bool currentRPCRelayIsOn = false; // Last known state of the RPC device
-bool RPCRelayStateKnown = false;  // Whether the relay state has been successfully fetched
+// --- Multi-RPC Connection Management ---
+// Single On-Demand RPC Client
+WebSocketsClient rpcClient;
+enum RpcTaskStatus { RPC_IDLE, RPC_CONNECTING, RPC_SENDING, RPC_WAITING };
+RpcTaskStatus rpcStatus = RPC_IDLE;
+
+enum ActionType : uint8_t {
+  ACTION_NONE = 0,
+  ACTION_RPC_TOGGLE = 1,
+  ACTION_RPC_ON = 2,
+  ACTION_RPC_OFF = 3,
+  ACTION_HTTP = 4,
+  ACTION_RPC_GET_STATUS = 5
+};
 
 // New globals for RPC command timeout
 unsigned long DeviceCmdSentTime = 0;
@@ -59,6 +66,41 @@ bool DeviceCmdWaitingForResponse = false;
 const unsigned long RPC_CMD_TIMEOUT_MS = 5000; // 5 seconds
 const int RPC_CMD_TIMEOUT_STATUS_CODE = -100; // Special timeout command
 
+struct RpcTask {
+    char ip[IP_MAX_LEN];
+    int switchId;
+    uint16_t mappingId;
+    ActionType type;
+    unsigned int msgId;
+};
+
+RpcTask currentRpcTask;
+unsigned int globalMsgId = 1;
+
+void onRpcEvent(WStype_t type, uint8_t* payload, size_t length);
+
+void startOnDemandRpc(const char* ip, int switchId, uint16_t mappingId, ActionType type) {
+    if (rpcStatus != RPC_IDLE) {
+        Serial.println("[RPC] Client busy with another command, skipping task.");
+        return;
+    }
+    
+    strncpy(currentRpcTask.ip, ip, IP_MAX_LEN - 1);
+    currentRpcTask.switchId = switchId;
+    currentRpcTask.mappingId = mappingId;
+    currentRpcTask.type = type;
+    currentRpcTask.msgId = globalMsgId++;
+
+    Serial.printf("[RPC] Opening on-demand connection to %s\n", ip);
+    rpcStatus = RPC_CONNECTING;
+    rpcClient.begin(currentRpcTask.ip, 80, "/rpc");
+    rpcClient.onEvent(onRpcEvent);
+    DeviceCmdSentTime = millis();
+    DeviceCmdWaitingForResponse = true;
+    DeviceCmdIdSent = currentRpcTask.msgId;
+    DeviceCmdOriginatingMappingId = mappingId;
+}
+
 // --- Globals for RF Action Mappings ---
 int learnModeForMappingIndex = -1; // -1 if not in learn mode, otherwise index of mapping being learned
 unsigned long learnModeStartTime = 0; // Timestamp for learn mode activation
@@ -66,13 +108,10 @@ const unsigned long LEARN_MODE_TIMEOUT_MS = 30000;
 #define MAX_SUPPORTED_RF_MAPPINGS 25
 
 // --- New RF Action Mapping Structures ---
-#define MAX_URL_LEN 64       // Max length for URLs
-#define MAX_HEADERS_LEN 64   // Max length for HTTP POST headers (e.g., "Content-Type: application/json")
-#define MAX_JSON_DATA_LEN 64 // Max length for HTTP POST JSON data (e.g., {"value":1})
+#define MAX_URL_LEN 48       // Reduced to save RAM for 25 mappings
+#define MAX_HEADERS_LEN 32   
+#define MAX_JSON_DATA_LEN 48 
 #define MAX_HTTP_STEPS_PER_MAPPING 5 // Max number of HTTP commands in a chain for one mapping
-
-// Define IP_MAX_LEN before it's used in RfActionMapping struct and other places
-#define IP_MAX_LEN 16 // For "xxx.xxx.xxx.xxx\0"
 
 enum HttpMethod : uint8_t {
   HTTP_METHOD_GET = 0,
@@ -93,14 +132,6 @@ struct HttpStep {
   }
 };
 
-enum ActionType : uint8_t {
-  ACTION_NONE = 0,
-  ACTION_RPC_TOGGLE = 1,
-  ACTION_RPC_ON = 2,
-  ACTION_RPC_OFF = 3,
-  ACTION_HTTP = 4
-};
-
 struct RfActionMapping {
   uint16_t id; // Unique ID for this mapping, assigned by the server
   unsigned long rfCode;
@@ -110,15 +141,18 @@ struct RfActionMapping {
   HttpStep httpSteps[MAX_HTTP_STEPS_PER_MAPPING];
   uint8_t numHttpSteps;
   bool enabled;
+  // RPC Status fields for UI badges
+  bool rpcConnected;
+  bool rpcRelayOn;
+  bool rpcStateKnown;
 
-  RfActionMapping() : id(0), rfCode(0), actionType(ACTION_NONE), RPC_SwitchId(0), numHttpSteps(0), enabled(false) {
+  RfActionMapping() : id(0), rfCode(0), actionType(ACTION_NONE), RPC_SwitchId(0), numHttpSteps(0), enabled(false), rpcConnected(false), rpcRelayOn(false), rpcStateKnown(false) {
     memset(RPC_IP, 0, IP_MAX_LEN);
   }
 };
 
 std::vector<RfActionMapping> rfActionMappings; // Dynamic list of mappings
 
-// --- Global Variables ---
 void loadRfMappingsFromFS();
 bool saveRfMappingsToFS();
 void handleSerialCommands();
@@ -132,9 +166,7 @@ void handleNotFound();
 void setClock();
 void parseAndAddHeader(HTTPClient& http, const char* headerLine);
 void webSocketEvent(uint8_t num, WStype_t type, uint8_t * payload, size_t length); // WebSocket event handler
-void RPCEvent(WStype_t type, uint8_t * payload, size_t length); // RPC WebSocket client event handler
-void requestDeviceSwitchStatus(); // New: to get current device switch state
-void sendRpcCommand(const JsonDocument& doc, int switchId, uint16_t originatingMappingId, const String& commandType);
+void sendRpcCommandOnDemand();
 void sendDeviceToggleCommand(const char* deviceIp, int switchId, uint16_t originatingMappingId);
 void sendDeviceSetCommand(const char* deviceIp, int switchId, bool turnOn, uint16_t originatingMappingId);
 void executeActionForRfCode(unsigned long rfCode); // Executes the action for a given mapping index (found by RF code)
@@ -205,12 +237,12 @@ void handleRestore() {
     return;
   }
 
-  if (doc.containsKey("config")) {
+  if (doc["config"].is<JsonObject>()) {
     File cf = LittleFS.open("/config.json", "w");
     if (cf) { serializeJson(doc["config"], cf); cf.close(); }
   }
 
-  if (doc.containsKey("mappings")) {
+  if (doc["mappings"].is<JsonArray>()) {
     File mf = LittleFS.open("/mappings.json", "w");
     if (mf) { serializeJson(doc["mappings"], mf); mf.close(); }
   }
@@ -402,30 +434,9 @@ void setup() {
   server.begin();
   Serial.println("HTTP server started. Access at http://" + WiFi.localIP().toString() + "/");
 
-  // --- Find first RPC device and attempt connection ---
-  if (WiFi.status() == WL_CONNECTED) {
-    String firstRpcIp = "";
-    for (const auto& mapping : rfActionMappings) {
-        if ((mapping.actionType >= ACTION_RPC_TOGGLE && mapping.actionType <= ACTION_RPC_OFF) && strlen(mapping.RPC_IP) > 0) {
-            firstRpcIp = mapping.RPC_IP;
-            break;
-        }
-    }
-
-    if (firstRpcIp.length() > 0) {
-        Serial.printf("Found first RPC device in mappings. Attempting to connect to %s\n", firstRpcIp.c_str());
-        // The port for Shelly Gen2/Plus/Pro RPC is 80, and the URL is /rpc
-        RPC.begin(firstRpcIp.c_str(), 80, "/rpc");
-    }
-  }
-
   webSocket.begin();
   webSocket.onEvent(webSocketEvent);
   Serial.println("WebSocket server started on port 81.");
-
-  // Initialize RPC WebSocket client
-  RPC.onEvent(RPCEvent);
-  RPC.setReconnectInterval(5000); // Library's own reconnect interval
 
   Serial.println("Setup complete. Waiting for RF signals or serial commands...");
   Serial.println("Type 'help' for a list of commands.");
@@ -803,6 +814,9 @@ void printHelp() {
   Serial.println();
 }
 
+// Static buffer for serial input
+static String serialInputBuffer = "";
+
 void handleSerialCommands() {
   if (Serial.available() > 0) {
     String command = Serial.readStringUntil('\n');
@@ -810,7 +824,7 @@ void handleSerialCommands() {
 
     if (command.equalsIgnoreCase("help")) {
       printHelp();
-    } else if (command.equalsIgnoreCase("wifi setup")) {
+    } else if (command.equalsIgnoreCase("wifi setup")) { // This function is blocking, but only called on demand.
       interactiveConfigSetup();
     } else if (command.length() > 0) { // Potential send command or unknown
       String commandCopy = command; // Work with a copy for modification
@@ -839,7 +853,7 @@ void handleSerialCommands() {
         }
         if (codeToSend == 0) {
           Serial.println("Send command error: RF code is missing or invalid (cannot be 0).");
-          Serial.println("Usage: send <rf_code> [repeats]");
+          Serial.println("Usage: send <rf_code> [repeats]"); // No return here, just print error and continue
           return; // Exit if code is invalid
         }
         
@@ -957,11 +971,164 @@ void handleSerialCommands() {
         Serial.println(command);
         printHelp();
       }
-    } else {
-      // Empty command, do nothing
     }
-    // Clear remaining serial buffer
-    while(Serial.available() > 0) { Serial.read(); }
+  }
+}
+
+// Refactored handleSerialCommands to be non-blocking
+void handleSerialCommands_NonBlocking() {
+  while (Serial.available() > 0) {
+    char c = Serial.read();
+    if (c == '\n' || c == '\r') { // Process on newline or carriage return
+      if (serialInputBuffer.length() > 0) {
+        String command = serialInputBuffer;
+        serialInputBuffer = ""; // Clear buffer for next command
+        command.trim();
+
+        if (command.equalsIgnoreCase("help")) {
+          printHelp();
+        } else if (command.equalsIgnoreCase("wifi setup")) {
+          // NOTE: This function contains blocking loops and will halt execution until serial input is received.
+          // This is acceptable for an interactive setup function that is not part of the main loop's continuous execution.
+          interactiveConfigSetup();
+        } else if (command.length() > 0) {
+          String commandCopy = command;
+          commandCopy.toLowerCase();
+
+          if (commandCopy.startsWith("send ")) {
+            String args = command.substring(5);
+            args.trim();
+
+            unsigned long codeToSend = 0;
+            const unsigned int bitLength = 24;
+            const unsigned int protocol = 1;
+            unsigned int repeats = 200;
+
+            String part;
+            int spaceIdx;
+
+            spaceIdx = args.indexOf(' ');
+            if (spaceIdx == -1) { part = args; args = ""; }
+            else { part = args.substring(0, spaceIdx); args = args.substring(spaceIdx + 1); args.trim(); }
+            
+            if (part.length() > 0) {
+              codeToSend = strtoul(part.c_str(), nullptr, 10);
+            }
+            if (codeToSend == 0) {
+              Serial.println("Send command error: RF code is missing or invalid (cannot be 0).");
+              Serial.println("Usage: send <rf_code> [repeats]");
+            } else {
+                if (args.length() > 0) {
+                  part = args;
+                  if (part.length() > 0) repeats = atoi(part.c_str());
+                  if (repeats == 0 && part != "0") {
+                    repeats = 200;
+                  } else if (repeats == 0 && part == "0") {
+                    repeats = 1;
+                  }
+                }
+
+                Serial.print("Preparing to send RF Code: "); Serial.println(codeToSend);
+                Serial.print("  Bit Length: "); Serial.println(bitLength);
+                Serial.print("  Protocol: "); Serial.println(protocol);
+                Serial.print("  Pulse Length: Using protocol default");
+                Serial.print("  Repeats: "); Serial.println(repeats);
+
+                mySwitch.disableReceive();
+                ELECHOUSE_cc1101.setPktFormat(3);
+                ELECHOUSE_cc1101.setGDO0(RF_DATA_PIN);
+                ELECHOUSE_cc1101.setPA(10);
+                ELECHOUSE_cc1101.SetTx();
+                currentCC1101Mode = "TX";
+
+                mySwitch.enableTransmit(RF_DATA_PIN);
+                mySwitch.setProtocol(protocol);
+
+                Serial.println("CC1101 configured for Transmitting Data. Sending repeats manually...");
+
+                for (unsigned int i = 0; i < repeats; ++i) {
+                    mySwitch.send(codeToSend, bitLength);
+                    yield();
+                }
+                Serial.println("\nAll RF Signal repeats sent via Serial.");
+
+                mySwitch.disableTransmit();
+                initialize_cc1101();
+                mySwitch.enableReceive(RF_DATA_PIN);
+                Serial.println("Transmission complete. Receiver re-enabled.");
+
+                broadcastStatusUpdate();
+            }
+          } else if (commandCopy.startsWith("set deviceip ")) {
+            Serial.println("Global 'set deviceip' command is deprecated. Configure Device IP per RF mapping via UI.");
+          } else if (commandCopy.startsWith("set deviceid ")) {
+            Serial.println("Global 'set deviceid' command is deprecated. Configure Device Switch ID per RF mapping via UI.");
+          } else if (commandCopy.startsWith("set freq ")) {
+            String freqStr = command.substring(9);
+            freqStr.trim();
+            float newFrequency = freqStr.toFloat();
+
+            if (newFrequency >= 387.000f && newFrequency <= 464.000f) {
+                currentFrequency = newFrequency;
+                initialize_cc1101();
+                Serial.print("CC1101 Frequency updated via Serial to: "); Serial.print(currentFrequency, 3); Serial.println(" MHz.");
+                saveConfiguration(); 
+                broadcastAlert("cc1101ConfigPane", "CC1101 Frequency updated via Serial to: " + String(currentFrequency, 3) + " MHz.", "success", 5000);
+                broadcastStatusUpdate();
+            } else {
+                Serial.print("Invalid Frequency '"); Serial.print(freqStr); Serial.println("'. Must be between 387.000 and 464.000 MHz.");
+                broadcastAlert("cc1101ConfigPane", "Invalid Frequency '" + escapeJsonString(freqStr) + "'. Must be between 387.000 and 464.000 MHz.", "danger", 5000);
+            }
+          } else if (commandCopy.startsWith("set bandwidth ")) {
+            String bwStr = command.substring(14);
+            bwStr.trim();
+            int newBandwidthInt = bwStr.toInt();
+
+            bool validBandwidth = false;
+            int allowedBandwidths[] = {58, 67, 81, 101, 116, 135, 162, 203, 232, 270, 325, 406, 464, 541, 650, 812};
+            for (int bw : allowedBandwidths) {
+              if (newBandwidthInt == bw) {
+                validBandwidth = true;
+                break;
+              }
+            }
+
+            if (validBandwidth) {
+                currentBandwidth = (float)newBandwidthInt;
+                initialize_cc1101();
+                Serial.print("CC1101 Bandwidth updated via Serial to: "); Serial.print(currentBandwidth, 0); Serial.println(" KHz.");            saveConfiguration(); 
+                broadcastAlert("cc1101ConfigPane", "CC1101 Bandwidth updated via Serial to: " + String(currentBandwidth, 0) + " KHz.", "success", 5000);
+                broadcastStatusUpdate();
+            } else {
+                Serial.print("Invalid Bandwidth '"); Serial.print(bwStr); Serial.println("'. Select from allowed values (58, 67, 81, 101, 116, 135, 162, 203, 232, 270, 325, 406, 464, 541, 650, 812).");
+                broadcastAlert("cc1101ConfigPane", "Invalid Bandwidth '" + escapeJsonString(bwStr) + "'. Select from allowed values.", "danger", 5000);
+            }
+          } else if (commandCopy.startsWith("set rate ")) {
+            String rateStr = command.substring(9);
+            rateStr.trim();
+            float newDataRate = rateStr.toFloat();
+
+            if (newDataRate >= 0.6f && newDataRate <= 600.0f) {
+                currentDataRate = newDataRate;
+                initialize_cc1101();
+                Serial.print("CC1101 Data Rate updated via Serial to: "); Serial.print(currentDataRate, 1); Serial.println(" kBaud.");
+                saveConfiguration(); 
+                broadcastAlert("cc1101ConfigPane", "CC1101 Data Rate updated via Serial to: " + String(currentDataRate, 1) + " kBaud.", "success", 5000);
+                broadcastStatusUpdate();
+            } else {
+                Serial.print("Invalid Data Rate '"); Serial.print(rateStr); Serial.println("'. Must be between 0.6 and 600.0 kBaud.");
+                broadcastAlert("cc1101ConfigPane", "Invalid Data Rate '" + escapeJsonString(rateStr) + "'. Must be between 0.6 and 600.0 kBaud.", "danger", 5000);
+            }
+          } else { 
+            Serial.print("Unknown command: ");
+            Serial.println(command);
+            printHelp();
+          }
+        }
+      }
+    } else {
+      serialInputBuffer += c;
+    }
   }
 }
 
@@ -1000,15 +1167,6 @@ void sendFullStatusToClient(uint8_t clientNum) {
     wifi_connected_html = "<span class='status-badge badge-danger'>Disconnected</span>";
   }
 
-  String device_relay_status_html;
-  if (RPCRelayStateKnown) {
-    device_relay_status_html = currentRPCRelayIsOn ?
-        "<span class='status-badge badge-success'>ON</span>" : 
-        "<span class='status-badge badge-danger'>OFF</span>";
-  } else {
-    device_relay_status_html = "<span class='status-badge badge-muted'>Unknown</span>";
-  }
-  
   String cc1101_freq_html = "<span class='status-badge badge-muted'>" + String(currentFrequency, 2) + " MHz</span>";
   String cc1101_bandwidth_html = "<span class='status-badge badge-muted'>" + String(currentBandwidth, 0) + " KHz</span>";
   String cc1101_rate_html = "<span class='status-badge badge-muted'>" + String(currentDataRate, 1) + " kBaud</span>";
@@ -1028,7 +1186,6 @@ void sendFullStatusToClient(uint8_t clientNum) {
   jsonPayload += "\"cc1101Frequency_form_val\":\"" + String(currentFrequency, 3) + "\",";
   jsonPayload += "\"cc1101Bandwidth_form_val\":\"" + String(currentBandwidth, 0) + "\",";
   jsonPayload += "\"cc1101DataRate_form_val\":\"" + String(currentDataRate, 1) + "\",";
-  jsonPayload += "\"device-relay-status-val\":\"" + escapeJsonString(device_relay_status_html) + "\",";
   jsonPayload += "\"device_switch_id_form_val\":\"0\""; // Default for modal if no specific mapping is loaded, or consider removing if not used globally
 
   // Add RF Mappings to payload
@@ -1036,12 +1193,16 @@ void sendFullStatusToClient(uint8_t clientNum) {
   for (size_t i = 0; i < rfActionMappings.size(); ++i) {
     if (i > 0) jsonPayload += ",";
     const RfActionMapping& mapping = rfActionMappings[i];
+
     jsonPayload += "{";
     jsonPayload += "\"id\":" + String(mapping.id) + ","; 
     jsonPayload += "\"rf_code\":" + String(mapping.rfCode) + ",";
     jsonPayload += "\"action_type\":" + String((int)mapping.actionType) + ",";
     jsonPayload += "\"RPC_IP\":\"" + escapeJsonString(String(mapping.RPC_IP)) + "\",";
     jsonPayload += "\"RPC_SwitchId\":" + String(mapping.RPC_SwitchId) + ",";
+    jsonPayload += "\"rpc_connected\":" + String(mapping.rpcConnected ? "true" : "false") + ",";
+    jsonPayload += "\"rpc_relay_on\":" + String(mapping.rpcRelayOn ? "true" : "false") + ",";
+    jsonPayload += "\"rpc_state_known\":" + String(mapping.rpcStateKnown ? "true" : "false") + ",";
     jsonPayload += "\"num_http_steps\":" + String(mapping.numHttpSteps) + ",";
     jsonPayload += "\"http_request_chain\":["; // Start of http_request_chain array
     for (uint8_t j = 0; j < mapping.numHttpSteps && j < MAX_HTTP_STEPS_PER_MAPPING; ++j) {
@@ -1086,27 +1247,33 @@ void broadcastAlert(const String& paneId, const String& message, const String& a
 void loop() {
   server.handleClient();
   webSocket.loop();
-  handleSerialCommands();
+  handleSerialCommands_NonBlocking(); // Use the non-blocking version
 
   // RPC Command Timeout Check
   if (DeviceCmdWaitingForResponse && (millis() - DeviceCmdSentTime > RPC_CMD_TIMEOUT_MS)) {
     Serial.printf("[RPC] Command (MsgID %u, MappingID %u) timed out.\n", DeviceCmdIdSent, DeviceCmdOriginatingMappingId);
-    broadcastAlert("rfControlPane", "RPC command for Mapping ID " + String(DeviceCmdOriginatingMappingId) + " (MsgID " + String(DeviceCmdIdSent) + ") timed out.", "warning", 5000);
-    DeviceCmdWaitingForResponse = false; // Stop waiting for this specific command
-    // Consecutive failure tracking removed.
-    // Update the specific mapping's status to indicate timeout
-    if (DeviceCmdOriginatingMappingId != 0) {
-        for (size_t i = 0; i < rfActionMappings.size(); ++i) {
-            if (rfActionMappings[i].id == DeviceCmdOriginatingMappingId) {
-                // lastHttpStatusCode is not directly on RfActionMapping for RPC actions.
-                // The alert already informs the user. If a specific status needs to be stored for the mapping,
-                // a new member or different handling would be required. For now, rely on the alert.
-                break;
-            }
+    
+    // Ensure we only alert once and stop waiting
+    DeviceCmdWaitingForResponse = false; 
+    broadcastAlert("rfControlPane", "RPC command for Mapping ID " + String(DeviceCmdOriginatingMappingId) + " timed out.", "warning", 5000);
+    
+    // Mark mapping as disconnected
+    for (auto& m : rfActionMappings) {
+        if (m.id == currentRpcTask.mappingId) {
+            m.rpcConnected = false;
+            m.rpcStateKnown = false;
+            broadcastStatusUpdate();
+            break;
         }
     }
-  }
 
+    // Only call disconnect if we aren't already idling
+    if (rpcStatus != RPC_IDLE) {
+        rpcClient.disconnect();
+        // We don't set rpcStatus = RPC_IDLE here; 
+        // let onRpcEvent handle it to avoid duplicate prints.
+    }
+  }
 
   // Check for learn mode timeout
   if (learnModeForMappingIndex != -1 && (millis() - learnModeStartTime > LEARN_MODE_TIMEOUT_MS)) {
@@ -1163,6 +1330,7 @@ void loop() {
     } else { // Normal operation mode
       // Iterate through dynamic list to find a match
       for (size_t i = 0; i < rfActionMappings.size(); ++i) {
+        yield(); // Allow other tasks to run, especially if many mappings
         if (rfActionMappings[i].enabled && rfActionMappings[i].rfCode != 0 && rfActionMappings[i].rfCode == receivedCode) {
           Serial.printf("Matched RF code %lu from mapping ID %u.\n", receivedCode, rfActionMappings[i].id);
           broadcastAlert("rfControlPane", "Matched RF code (" + String(receivedCode) + ") from mapping ID " + String(rfActionMappings[i].id) + ".", "info", 3000);
@@ -1174,169 +1342,106 @@ void loop() {
     mySwitch.resetAvailable();
   }
 
-  // The global RPC.loop() and connectToDevice() calls in loop() are
-  // problematic without a single global device IP. For now, RPC actions will attempt to connect on-demand.
-  // A more robust solution would involve managing multiple client connections or a single dynamic one.
-  RPC.loop(); // Still need to process events if a connection was manually established by an action
+  rpcClient.loop();
+
   yield(); // Allow ESP8266 background tasks to run
 }
 
-void requestDeviceSwitchStatus() {
-    // This function also needs a target IP and switch ID for a specific device.
-    // It's not suitable for a generic global status request anymore.
-    if (!isDeviceConnected) {
-        Serial.println("Not connected to RPC device. Cannot request switch status.");
-        // Optionally try to connect: connectToDevice();
-        return;
-    }
-
+void sendRpcCommandOnDemand() {
     JsonDocument doc;
-    unsigned int currentCmdId = DeviceMsgId++; // Capture ID before incrementing for next use
-    doc["id"] = currentCmdId;
-    doc["method"] = "Switch.GetStatus";
-    doc["params"]["id"] = 0; // Placeholder, this needs to be dynamic based on context or removed if not used globally
+    doc["id"] = currentRpcTask.msgId;
+    
+    if (currentRpcTask.type == ACTION_RPC_TOGGLE) {
+        doc["method"] = "Switch.Toggle";
+    } else if (currentRpcTask.type == ACTION_RPC_GET_STATUS) {
+        doc["method"] = "Switch.GetStatus";
+    } else {
+        doc["method"] = "Switch.Set";
+        doc["params"]["on"] = (currentRpcTask.type == ACTION_RPC_ON);
+    }
+    doc["params"]["id"] = currentRpcTask.switchId;
 
     String rpcMessage;
     serializeJson(doc, rpcMessage);
-    Serial.print("Requesting Device Switch Status (ID: "); Serial.print(currentCmdId); Serial.print("): "); Serial.println(rpcMessage);
-    
-    // Set up for timeout tracking
-    DeviceCmdIdSent = currentCmdId;
-    DeviceCmdSentTime = millis();
-    // DeviceCmdOriginatingMappingId is not set here as this is a general status request, not tied to a specific mapping.
-    DeviceCmdWaitingForResponse = true;
-    
-    RPC.sendTXT(rpcMessage);
+    rpcClient.sendTXT(rpcMessage);
+    rpcStatus = RPC_WAITING;
 }
 
-void sendRpcCommand(const JsonDocument& doc, int switchId, uint16_t originatingMappingId, const String& commandType) {
-    String rpcMessage;
-    serializeJson(doc, rpcMessage);
-
-    unsigned int cmdId = doc["id"];
-
-    Serial.print("Sending RPC " + commandType + " (MsgID: "); Serial.print(cmdId); Serial.print(", MappingID: "); Serial.print(originatingMappingId); Serial.print(" for switch "); Serial.print(switchId); Serial.print("): ");
-    Serial.println(rpcMessage);
-
-    // Set up for timeout tracking
-    DeviceCmdIdSent = cmdId;
-    DeviceCmdSentTime = millis();
-    DeviceCmdOriginatingMappingId = originatingMappingId;
-    DeviceCmdWaitingForResponse = true;
-
-    RPC.sendTXT(rpcMessage);
-    broadcastAlert("rfControlPane", "RPC " + commandType + " for Mapping ID " + String(originatingMappingId) + " (Switch " + String(switchId) + ") sent. Waiting...", "info", 0);
-}
 
 void sendDeviceToggleCommand(const char* deviceIp, int switchId, uint16_t originatingMappingId) {
-    if (!isDeviceConnected) {
-        Serial.printf("Attempting Toggle for %s (ID %d) - RPC not connected. Action may fail.\n", deviceIp, switchId);
-    }
-    JsonDocument doc;
-    doc["id"] = DeviceMsgId++;
-    doc["method"] = "Switch.Toggle";
-    doc["params"]["id"] = switchId;
-
-    sendRpcCommand(doc, switchId, originatingMappingId, "Toggle");
+    startOnDemandRpc(deviceIp, switchId, originatingMappingId, ACTION_RPC_TOGGLE);
 }
 
 void sendDeviceSetCommand(const char* deviceIp, int switchId, bool turnOn, uint16_t originatingMappingId) {
-    if (!isDeviceConnected) {
-        Serial.printf("Attempting Set for %s (ID %d) - RPC not connected. Action may fail.\n", deviceIp, switchId);
-    }
-
-    JsonDocument doc;
-    doc["id"] = DeviceMsgId++;
-    doc["method"] = "Switch.Set";
-    JsonObject params = doc["params"].to<JsonObject>();
-    params["id"] = switchId;
-    params["on"] = turnOn;
-
-    sendRpcCommand(doc, switchId, originatingMappingId, "Set");
+    startOnDemandRpc(deviceIp, switchId, originatingMappingId, turnOn ? ACTION_RPC_ON : ACTION_RPC_OFF);
 }
 
-void RPCEvent(WStype_t type, uint8_t * payload, size_t length) {
+void onRpcEvent(WStype_t type, uint8_t * payload, size_t length) {
     switch(type) {
         case WStype_DISCONNECTED:
-            isDeviceConnected = false;
-            Serial.println("[RPC] Disconnected!");
-            // Consecutive failure tracking removed.
+            // Only act if we were actually expecting a connection
+            if (rpcStatus != RPC_IDLE) {
+                Serial.println("[RPC] Disconnected.");
+                rpcStatus = RPC_IDLE;
+                DeviceCmdWaitingForResponse = false;
+            }
             break;
         case WStype_CONNECTED:
-            isDeviceConnected = true;
-            Serial.print("[RPC] Connected to: "); Serial.println((char*)payload);
-            RPCRelayStateKnown = false; // State is unknown until GetStatus returns
-            // Consecutive failure tracking removed.
-            requestDeviceSwitchStatus(); // Request current status upon connection, this will set up timeout tracking
+            Serial.printf("[RPC] Connected to: %s\n", (char*)payload);
+            sendRpcCommandOnDemand();
             break;
         case WStype_TEXT:
-            // Some RPC devices send simple text-based pings. We handle them here to keep the log clean.
             if (strcmp((const char*)payload, "ping") == 0) {
-                RPC.sendTXT("pong"); // Respond to the ping to keep the connection alive
-                break;               // And don't log it
+                rpcClient.sendTXT("pong"); 
+                break;
             }
-            Serial.printf("[RPC] Got text: %s\n", payload);
+
             {
                 JsonDocument doc;
                 DeserializationError error = deserializeJson(doc, payload, length);
                 if (error) {
-                    Serial.printf("[RPC] JSON parse error: %s\n", error.c_str());
-                    broadcastAlert("rfControlPane", "RPC: Error parsing response.", "danger", 5000);
+                    rpcClient.disconnect();
                     break;
                 }
 
-                unsigned int responseId = doc["id"].as<unsigned int>(); // Get response ID
+                unsigned int responseId = doc["id"].as<unsigned int>();
 
                 if (DeviceCmdWaitingForResponse && responseId == DeviceCmdIdSent) {
-                    Serial.printf("[RPC] Received response for command ID %u.\n", responseId);
-                    DeviceCmdWaitingForResponse = false; // Clear waiting flag
-                    // Consecutive failure tracking removed.
-                    // If this command was from a mapping, clear its timeout status
-                    if (DeviceCmdOriginatingMappingId != 0) {
-                        for (size_t i = 0; i < rfActionMappings.size(); ++i) {
-                            if (rfActionMappings[i].id == DeviceCmdOriginatingMappingId) {
-                                // lastHttpStatusCode is not directly on RfActionMapping for RPC actions.
-                                // Clearing a timeout status would be handled differently if needed.
-                                // broadcastStatusUpdate() will be called later if relay state changes
+                    DeviceCmdWaitingForResponse = false;
+                    if (doc["error"].is<JsonObject>()) {
+                        String errorMsg = doc["error"]["message"].as<String>();
+                        broadcastAlert("rfControlPane", "RPC Error: " + errorMsg, "danger", 5000);
+                    } else {
+                        // Update mapping state based on result
+                        for (auto& m : rfActionMappings) {
+                            if (m.id == currentRpcTask.mappingId) {
+                                m.rpcConnected = true;
+                                m.rpcStateKnown = true;
+                                JsonObject result = doc["result"];
+                                if (result["output"].is<bool>()) m.rpcRelayOn = result["output"];
+                                else if (result["ison"].is<bool>()) m.rpcRelayOn = result["ison"];
+                                else if (result["was_on"].is<bool>()) m.rpcRelayOn = !result["was_on"]; // For toggle responses
+                                
+                                broadcastStatusUpdate();
                                 break;
                             }
                         }
-                    }
-                    // Consecutive failure tracking removed.
-                } else if (DeviceCmdWaitingForResponse) {
-                    Serial.printf("[RPC] Received response ID %u, but was waiting for ID %u (or not waiting).\n", responseId, DeviceCmdIdSent);
-                    // This could be an old/unexpected response. Don't clear DeviceCmdWaitingForResponse for the current outstanding command.
-                }
-
-                if (doc["error"].is<JsonObject>()) { // Updated check
-                    String errorMsg = doc["error"]["message"].as<String>();
-                    broadcastAlert("rfControlPane", "RPC Error: " + escapeJsonString(errorMsg), "danger", 5000);
-                } else if (doc["result"].is<JsonObject>()) { // Updated check
-                    JsonObject result = doc["result"];
-                    // Check if it's a response to Switch.Toggle (has "was_on")
-                    if (result["was_on"].is<bool>()) { // Updated check
-                        bool was_on = result["was_on"].as<bool>();
-                        currentRPCRelayIsOn = !was_on;
-                        RPCRelayStateKnown = true;
-                        int toggledId = result["id"].is<int>() ? result["id"].as<int>() : -1; // Assuming "id" is in the result for Toggle
-                        broadcastAlert("rfControlPane", "Device relay (ID " + String(toggledId) + ") toggled. New state: " + String(currentRPCRelayIsOn ? "ON" : "OFF"), "success", 5000);
-                        broadcastStatusUpdate();
-                    }
-                    else if (result["ison"].is<bool>() || result["output"].is<bool>()) { 
-                        currentRPCRelayIsOn = result["ison"].is<bool>() ? result["ison"].as<bool>() : result["output"].as<bool>();
-                        RPCRelayStateKnown = true;
-                        int statusId = result["id"].is<int>() ? result["id"].as<int>() : -1; // Assuming "id" is in the result for GetStatus
-                        Serial.println("[RPC] Status updated for ID " + String(statusId) + ". State: " + String(currentRPCRelayIsOn ? "ON" : "OFF"));
-                        broadcastStatusUpdate();
-                    } else {
-                        broadcastAlert("rfControlPane", "RPC command successful (unknown response type).", "success", 5000);
+                        broadcastAlert("rfControlPane", "RPC Success (ID " + String(currentRpcTask.mappingId) + ")", "success", 3000);
                     }
                 }
+                // Clean up after handling the response
+                rpcClient.disconnect();
             }
             break;
         case WStype_PONG:
             break;
-        case WStype_ERROR: Serial.printf("[RPC] Error: %s\n", payload); isDeviceConnected = false; break;
+        case WStype_ERROR: 
+            if (rpcStatus != RPC_IDLE) {
+                Serial.printf("[RPC] Error: %s\n", payload); 
+                rpcClient.disconnect();
+                DeviceCmdWaitingForResponse = false;
+            }
+            break;
         default: break;
     }
 }
@@ -1348,7 +1453,7 @@ void webSocketEvent(uint8_t num, WStype_t type, uint8_t * payload, size_t length
             break;
         case WStype_CONNECTED: {
             IPAddress ip = webSocket.remoteIP(num);
-            Serial.printf("[WebSocket] [ID: %u] Connected from %s url: %s\n", num, ip.toString().c_str(), payload);
+            Serial.printf("[WebSocket] [ID: %u] Client IP: %s connected\n", num, ip.toString().c_str());
             // Send current status to the newly connected client
             sendFullStatusToClient(num);
 

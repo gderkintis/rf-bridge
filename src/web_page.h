@@ -455,12 +455,14 @@ function _renderSingleMappingCard(mapping) {
     // Generate status badge HTML first as it's needed for the header controls container
     let statusBadgeHtml = '';
     if (mapping.action_type >= 1 && mapping.action_type <= 3) { // ACTION_RPC_TOGGLE, ACTION_RPC_ON, ACTION_RPC_OFF
-        if (mapping.last_http_status_code === -100) { // RPC_CMD_TIMEOUT_STATUS_CODE
-            statusBadgeHtml = '<span class="status-badge badge-danger" style="padding: 0.25em 0.5em;">Status: Timeout</span>';
+        if (!mapping.rpc_connected) {
+            statusBadgeHtml = '<span class="status-badge badge-danger" style="padding: 0.25em 0.5em;">Status: Offline</span>';
+        } else if (!mapping.rpc_state_known) {
+            statusBadgeHtml = '<span class="status-badge badge-warning" style="padding: 0.25em 0.5em;">Status: Syncing...</span>';
         } else {
-            // Global RPC status will be updated by updateStatusDisplay
-            // The class global-RPC-status-cell is important here
-            statusBadgeHtml = `<span class="global-RPC-status-cell status-badge badge-muted" style="padding: 0.25em 0.5em;">Status: N/A</span>`;
+            let stateText = mapping.rpc_relay_on ? "ON" : "OFF";
+            let stateClass = mapping.rpc_relay_on ? "badge-success" : "badge-danger";
+            statusBadgeHtml = `<span class="status-badge ${stateClass}" style="padding: 0.25em 0.5em;">Status: ${stateText}</span>`;
         }
     } else if (mapping.action_type === 4) { // ACTION_HTTP
         let httpStatusText = "N/A";
@@ -997,13 +999,6 @@ function updateStatusDisplay(status) {
 
     const dataRateInput = document.getElementById('cc1101DataRate');
     if (dataRateInput && status['cc1101DataRate_form_val']) dataRateInput.value = status['cc1101DataRate_form_val'];
-
-    // Update Global RPC Status in RF Control Table
-    const rpcStatusCells = document.querySelectorAll('.global-RPC-status-cell');
-    const newRpcStatusHTML = status['device-relay-status-val'] || '<span class="status-badge badge-muted">Unknown</span>';
-    rpcStatusCells.forEach(cell => {
-        cell.innerHTML = newRpcStatusHTML;
-    });
 }
 document.addEventListener('DOMContentLoaded', function() {
     connectWebSocket(); // Initialize WebSocket connection
