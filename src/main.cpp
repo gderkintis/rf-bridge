@@ -155,29 +155,39 @@ void handleBackup() {
   server.setContentLength(CONTENT_LENGTH_UNKNOWN);
   server.send(200, "application/json", "");
 
-  auto streamFileToContent = [](const char* path, const char* fallback) {
-    File f = LittleFS.open(path, "r");
-    if (!f) {
-      server.sendContent(fallback);
-      return;
-    }
-    uint8_t buf[256];
-    while (f.available()) {
-      size_t len = f.read(buf, sizeof(buf));
-      server.sendContent((const char*)buf, len);
-    }
-    f.close();
-  };
+  JsonDocument backupDoc;
 
-  server.sendContent("{\"config\":");
-  streamFileToContent("/config.json", "{}");
-  server.sendContent(",\"mappings\":");
-  streamFileToContent("/mappings.json", "[]");
-  server.sendContent("}");
+  // Load config.json
+  File configFile = LittleFS.open("/config.json", "r");
+  if (configFile) {
+    DeserializationError error = deserializeJson(backupDoc["config"], configFile);
+    if (error) Serial.printf("Failed to deserialize config.json: %s\n", error.c_str());
+    configFile.close();
+  } else {
+    backupDoc["config"] = JsonObject(); // Empty object if file not found
+  }
+
+  // Load mappings.json
+  File mappingsFile = LittleFS.open("/mappings.json", "r");
+  if (mappingsFile) {
+    DeserializationError error = deserializeJson(backupDoc["mappings"], mappingsFile);
+    if (error) Serial.printf("Failed to deserialize mappings.json: %s\n", error.c_str());
+    mappingsFile.close();
+  } else {
+    backupDoc["mappings"] = JsonArray(); // Empty array if file not found
+  }
+
+  // Serialize the combined document to the client with pretty printing
+  // Using serializeJsonPretty for ArduinoJson v7+, or serializeJson(doc, output, 2) for v6
+  // This will consume more RAM during the backup process.
+  String output;
+  serializeJsonPretty(backupDoc, output); // Use serializeJsonPretty for human-readable output
+  server.sendContent(output);
 }
 
 void handleRestore() {
   server.sendHeader("Connection", "close");
+  server.setContentLength(CONTENT_LENGTH_UNKNOWN); // Ensure content length is unknown for chunked transfer
   
   File f = LittleFS.open("/restore.tmp", "r");
   if (!f) {
@@ -1334,11 +1344,11 @@ void RPCEvent(WStype_t type, uint8_t * payload, size_t length) {
 void webSocketEvent(uint8_t num, WStype_t type, uint8_t * payload, size_t length) {
     switch(type) {
         case WStype_DISCONNECTED:
-            Serial.printf("[%u] Disconnected!\n", num);
+            Serial.printf("[WebSocket] [ID: %u] Disconnected!\n", num);
             break;
         case WStype_CONNECTED: {
             IPAddress ip = webSocket.remoteIP(num);
-            Serial.printf("[%u] Connected from %s url: %s\n", num, ip.toString().c_str(), payload);
+            Serial.printf("[WebSocket] [ID: %u] Connected from %s url: %s\n", num, ip.toString().c_str(), payload);
             // Send current status to the newly connected client
             sendFullStatusToClient(num);
 
@@ -1347,9 +1357,9 @@ void webSocketEvent(uint8_t num, WStype_t type, uint8_t * payload, size_t length
                 String reconnectedAlertJson = "{\"type\":\"alert\", \"payload\":{\"paneId\":\"systemMaintenancePane\","
                                          "\"message\":\"Device has reconnected.\",\"alertType\":\"success\",\"duration\":5000}}";
                 if (webSocket.sendTXT(num, reconnectedAlertJson)) {
-                    Serial.printf("[%u] Sent 'Device has reconnected.' alert.\n", num);
+                    Serial.printf("[WebSocket] [ID: %u] Sent 'Device has reconnected.' alert.\n", num);
                 } else {
-                    Serial.printf("[%u] Failed to send 'Device has reconnected.' alert.\n", num);
+                    Serial.printf("[WebSocket] [ID: %u] Failed to send 'Device has reconnected.' alert.\n", num);
                 }
                 g_justRebootedFromClientCommand = false; 
             }
@@ -1361,7 +1371,7 @@ void webSocketEvent(uint8_t num, WStype_t type, uint8_t * payload, size_t length
                 DeserializationError error = deserializeJson(doc, payload, length);
 
                 if (error) {
-                    Serial.printf("[%u] deserializeJson() failed: %s\n", num, error.c_str());
+                    Serial.printf("[WebSocket] [ID: %u] deserializeJson() failed: %s\n", num, error.c_str());
                     broadcastAlert("global", "Invalid command format received.", "danger", 5000);
                     return;
                 }
@@ -1375,7 +1385,7 @@ void webSocketEvent(uint8_t num, WStype_t type, uint8_t * payload, size_t length
             }
             break;
         case WStype_BIN:
-            Serial.printf("[%u] get binary length: %u\n", num, length);
+            Serial.printf("[WebSocket] [ID: %u] get binary length: %u\n", num, length);
             break;
         case WStype_PING:
             // Library automatically sends PONG
@@ -1388,7 +1398,7 @@ void webSocketEvent(uint8_t num, WStype_t type, uint8_t * payload, size_t length
         case WStype_FRAGMENT:
         case WStype_FRAGMENT_FIN:
         default:
-            Serial.printf("[%u] Unknown WStype: %d\n", num, type);
+            Serial.printf("[WebSocket] [ID: %u] Unknown WStype: %d\n", num, type);
             break;
     }
 }
@@ -1398,7 +1408,7 @@ void handleWebSocketCommand(uint8_t clientNum, const char* action, JsonObject& p
         broadcastAlert("global", "Command action missing.", "danger", 5000);
         return;
     }
-    Serial.printf("[%u] Processing WebSocket command: %s\n", clientNum, action);
+    Serial.printf("[WebSocket] [ID: %u] Processing WebSocket command: %s\n", clientNum, action);
 
     if (strcmp(action, "learnForMappingIndex") == 0) {
         if (payload["index"].isNull() || !payload["index"].is<int>()) {
@@ -1720,7 +1730,7 @@ void handleWebSocketCommand(uint8_t clientNum, const char* action, JsonObject& p
         delay(1000); // Original delay, also allows clients to process the close frame
         ESP.restart();
     } else {
-        Serial.printf("[%u] Unknown WebSocket command action: %s\n", clientNum, action);
+        Serial.printf("[WebSocket] [ID: %u] Unknown WebSocket command action: %s\n", clientNum, action);
         String unknownCmdMsg = "Unknown command action: " + String(action);
         // Construct JSON with duration for the alert about unknown command
         String alertJson = "{\"type\":\"alert\", \"payload\":{\"paneId\":\"global\",\"message\":\"" + escapeJsonString(unknownCmdMsg) + "\",\"alertType\":\"danger\",\"duration\":5000}}";
