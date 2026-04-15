@@ -117,7 +117,6 @@ struct RfActionMapping {
 };
 
 std::vector<RfActionMapping> rfActionMappings; // Dynamic list of mappings
-uint16_t nextRfMappingId = 1; // Counter for unique RF Mapping IDs
 
 // --- Global Variables ---
 void loadRfMappingsFromFS();
@@ -144,6 +143,78 @@ void broadcastStatusUpdate(); // Send full status to all WebSocket clients
 void broadcastAlert(const String& paneId, const String& message, const String& alertType, int duration = 5000); // Send alert to all WebSocket clients
 void handleWebSocketCommand(uint8_t clientNum, const char* action, JsonObject& cmdPayload); // New handler for WS commands
 String escapeJsonString(const String& str); // Forward declaration
+
+void handleBackup() {
+  time_t now = time(nullptr);
+  struct tm timeinfo;
+  gmtime_r(&now, &timeinfo);
+  char filename[64];
+  strftime(filename, sizeof(filename), "attachment; filename=backup-rf-bridge-%Y-%m-%d.json", &timeinfo);
+
+  server.sendHeader("Content-Disposition", filename);
+  server.setContentLength(CONTENT_LENGTH_UNKNOWN);
+  server.send(200, "application/json", "");
+
+  auto streamFileToContent = [](const char* path, const char* fallback) {
+    File f = LittleFS.open(path, "r");
+    if (!f) {
+      server.sendContent(fallback);
+      return;
+    }
+    uint8_t buf[256];
+    while (f.available()) {
+      size_t len = f.read(buf, sizeof(buf));
+      server.sendContent((const char*)buf, len);
+    }
+    f.close();
+  };
+
+  server.sendContent("{\"config\":");
+  streamFileToContent("/config.json", "{}");
+  server.sendContent(",\"mappings\":");
+  streamFileToContent("/mappings.json", "[]");
+  server.sendContent("}");
+}
+
+void handleRestore() {
+  server.sendHeader("Connection", "close");
+  
+  File f = LittleFS.open("/restore.tmp", "r");
+  if (!f) {
+    server.send(500, "application/json", "{\"success\":false,\"message\":\"Restore file error\"}");
+    return;
+  }
+
+  JsonDocument doc;
+  DeserializationError error = deserializeJson(doc, f);
+  f.close();
+  LittleFS.remove("/restore.tmp");
+
+  if (error) {
+    server.send(400, "application/json", "{\"success\":false,\"message\":\"Invalid backup format\"}");
+    return;
+  }
+
+  if (doc.containsKey("config")) {
+    File cf = LittleFS.open("/config.json", "w");
+    if (cf) { serializeJson(doc["config"], cf); cf.close(); }
+  }
+
+  if (doc.containsKey("mappings")) {
+    File mf = LittleFS.open("/mappings.json", "w");
+    if (mf) { serializeJson(doc["mappings"], mf); mf.close(); }
+  }
+
+  server.send(200, "application/json", "{\"success\":true,\"message\":\"Configuration restored. Rebooting...\"}");
+  
+  // Set the flag so the "reconnected" alert is triggered after the device reboots
+  File rf = LittleFS.open("/reboot.flag", "w");
+  if (rf) rf.close();
+  
+  delay(1000);
+  ESP.restart();
+}
+
 void interactiveConfigSetup(); // Forward declaration for interactive setup
 
 // --- Global Variables ---
@@ -303,6 +374,21 @@ void setup() {
   });
 
   server.onNotFound(handleNotFound);
+  server.on("/backup", HTTP_GET, handleBackup);
+  server.on("/restore", HTTP_POST, handleRestore, [](){
+    HTTPUpload& upload = server.upload();
+    static File restoreFile;
+    if (upload.status == UPLOAD_FILE_START) {
+      restoreFile = LittleFS.open("/restore.tmp", "w");
+    } else if (upload.status == UPLOAD_FILE_WRITE) {
+      if (restoreFile) restoreFile.write(upload.buf, upload.currentSize);
+    } else if (upload.status == UPLOAD_FILE_END) {
+      if (restoreFile) restoreFile.close();
+    } else if (upload.status == UPLOAD_FILE_ABORTED) {
+      if (restoreFile) { restoreFile.close(); LittleFS.remove("/restore.tmp"); }
+    }
+  });
+
   server.begin();
   Serial.println("HTTP server started. Access at http://" + WiFi.localIP().toString() + "/");
 
@@ -474,7 +560,6 @@ bool loadConfiguration() {
   currentFrequency = doc["freq"] | 433.92f;
   currentBandwidth = doc["bw"] | 101.0f;
   currentDataRate = doc["rate"] | 2.5f;
-  nextRfMappingId = doc["next_id"] | 1;
 
   // Validate settings
   if (!(currentFrequency >= 387.000f && currentFrequency <= 464.000f)) currentFrequency = 433.92f;
@@ -495,7 +580,6 @@ void saveConfiguration() {
   doc["freq"] = currentFrequency;
   doc["bw"] = currentBandwidth;
   doc["rate"] = currentDataRate;
-  doc["next_id"] = nextRfMappingId;
 
   serializeJson(doc, file);
   file.close();
@@ -520,7 +604,7 @@ void loadRfMappingsFromFS() {
     strncpy(m.RPC_IP, obj["rpc_ip"] | "", IP_MAX_LEN - 1);
     m.RPC_SwitchId = obj["rpc_sid"];
     m.enabled = obj["enabled"];
-    JsonArray steps = obj["steps"];
+    JsonArray steps = obj["http_request_chain"];
     m.numHttpSteps = 0;
     for (JsonObject s : steps) {
       if (m.numHttpSteps >= MAX_HTTP_STEPS_PER_MAPPING) break;
@@ -549,7 +633,7 @@ bool saveRfMappingsToFS() {
     obj["rpc_ip"] = mapping.RPC_IP;
     obj["rpc_sid"] = mapping.RPC_SwitchId;
     obj["enabled"] = mapping.enabled;
-    JsonArray steps = obj["steps"].to<JsonArray>();
+    JsonArray steps = obj["http_request_chain"].to<JsonArray>();
     for (int j = 0; j < mapping.numHttpSteps; j++) {
       JsonObject s = steps.add<JsonObject>();
       s["m"] = (int)mapping.httpSteps[j].method;
@@ -949,7 +1033,7 @@ void sendFullStatusToClient(uint8_t clientNum) {
     jsonPayload += "\"RPC_IP\":\"" + escapeJsonString(String(mapping.RPC_IP)) + "\",";
     jsonPayload += "\"RPC_SwitchId\":" + String(mapping.RPC_SwitchId) + ",";
     jsonPayload += "\"num_http_steps\":" + String(mapping.numHttpSteps) + ",";
-    jsonPayload += "\"http_steps\":["; // Start of http_steps array
+    jsonPayload += "\"http_request_chain\":["; // Start of http_request_chain array
     for (uint8_t j = 0; j < mapping.numHttpSteps && j < MAX_HTTP_STEPS_PER_MAPPING; ++j) {
         if (j > 0) jsonPayload += ",";
         const HttpStep& step = mapping.httpSteps[j];
@@ -961,7 +1045,7 @@ void sendFullStatusToClient(uint8_t clientNum) {
         jsonPayload += "\"lastHttpStatusCode\":" + String(step.lastHttpStatusCode);
         jsonPayload += "}";
     }
-    jsonPayload += "],"; // End of http_steps array
+    jsonPayload += "],"; // End of http_request_chain array
     jsonPayload += "\"enabled\":" + String(mapping.enabled ? "true" : "false");
     jsonPayload += "}";
   }
@@ -1350,8 +1434,8 @@ void handleWebSocketCommand(uint8_t clientNum, const char* action, JsonObject& p
                     rfActionMappings[i].RPC_IP[IP_MAX_LEN - 1] = '\0';
                     rfActionMappings[i].RPC_SwitchId = payload["RPC_SwitchId"].as<int>();
                     rfActionMappings[i].numHttpSteps = 0;
-                    if (payload["http_steps"].is<JsonArray>()) {
-                        JsonArray stepsArray = payload["http_steps"].as<JsonArray>();
+                    if (payload["http_request_chain"].is<JsonArray>()) {
+                        JsonArray stepsArray = payload["http_request_chain"].as<JsonArray>();
                         uint8_t stepCount = 0;
                         for (JsonVariant step_v : stepsArray) {
                             if (stepCount >= MAX_HTTP_STEPS_PER_MAPPING) break;
@@ -1420,8 +1504,8 @@ void handleWebSocketCommand(uint8_t clientNum, const char* action, JsonObject& p
             newMapping.rfCode = 0; // Learned separately
             
             newMapping.numHttpSteps = 0;
-            if (payload["http_steps"].is<JsonArray>()) {
-                JsonArray stepsArray = payload["http_steps"].as<JsonArray>();
+            if (payload["http_request_chain"].is<JsonArray>()) {
+                JsonArray stepsArray = payload["http_request_chain"].as<JsonArray>();
                 for (JsonVariant step_v : stepsArray) {
                     if (newMapping.numHttpSteps >= MAX_HTTP_STEPS_PER_MAPPING) break;
                     JsonObject stepObj = step_v.as<JsonObject>();
@@ -1439,8 +1523,6 @@ void handleWebSocketCommand(uint8_t clientNum, const char* action, JsonObject& p
                 newMapping.enabled = true; 
             }
             mapping_id = newMapping.id; // For the alert message
-
-            if (newIdToAssign >= nextRfMappingId) { nextRfMappingId = newIdToAssign + 1; }
         }
 
         if (saveRfMappingsToFS()) {

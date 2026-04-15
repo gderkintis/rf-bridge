@@ -234,6 +234,25 @@ const char PAGE_HTML[] PROGMEM = R"=====(
             <div class="card">
                 <div class="card-header">System Maintenance <span id="systemMaintenancePane-result" class="action-result"></span></div>
                 <div class="card-body text-center">
+            
+                    <p class="mb-3">Backup configuration:</p>
+                    <button type="button" class="btn btn-success action-button w-100" 
+                            style="max-width: 220px; display: block; margin-left: auto; margin-right: auto;"
+                            onclick="location.href='/backup'">Download</button>
+            
+                    <hr class="border-secondary mt-4 mb-3 w-75" style="display: block; margin-left: auto; margin-right: auto;">
+                    <p class="mb-3">Restore configuration (.json):</p>
+                    <form id="restoreConfigForm" 
+                          style="max-width: 350px; width: 100%; display: block; margin-left: auto; margin-right: auto; margin-bottom: 1rem;" 
+                          method="POST" action="/restore" enctype="multipart/form-data">
+                        <div style="max-width: 300px; display: block; margin-left: auto; margin-right: auto;" class="mb-3">
+                            <input type="file" name="backup" accept=".json" class="form-control-dark w-100">
+                        </div>
+                        <button type="submit" class="btn btn-warning w-100" 
+                                style="max-width: 220px; display: block; margin-left: auto; margin-right: auto;">Restore</button>
+                    </form>
+
+                    <hr class="border-secondary mt-4 mb-3 w-75" style="display: block; margin-left: auto; margin-right: auto;">
                     <p class="mb-3">Upload a new firmware (.bin) file:</p>
                     
                     <form id="firmwareUpdateForm" 
@@ -245,7 +264,7 @@ const char PAGE_HTML[] PROGMEM = R"=====(
                         <button type="submit" class="btn btn-primary w-100" 
                                 style="max-width: 220px; display: block; margin-left: auto; margin-right: auto;">Upload Firmware</button>
                     </form>
-            
+
                     <hr class="border-secondary mt-4 mb-3 w-75" style="display: block; margin-left: auto; margin-right: auto;">
                     <p class="mb-3">Reboot the device:</p>
                     <button type="button" id="rebootDeviceBtn" class="btn btn-danger action-button w-100" 
@@ -527,7 +546,7 @@ function _renderSingleMappingCard(mapping) {
                       <div><strong>RPC ID:</strong> ${mapping.RPC_SwitchId}</div>`;
     } else if (mapping.action_type === 4) { // ACTION_HTTP
         for (let k = 0; k < mapping.num_http_steps; k++) {
-            const step = mapping.http_steps[k];
+            const step = mapping.http_request_chain[k];
             paramsHtml += `<div class="mb-1 ms-3"><strong>Request ${k+1} (${step.method === 0 ? 'GET' : 'POST'}):</strong> ${step.url || '<span class="text-muted">No URL</span>'}</div>`;
             if (step.method === 1) { // POST
                  if (step.headers && step.headers.length > 0) {
@@ -668,8 +687,8 @@ function openRfMappingModal(index = -1, mapping = null) {
         document.getElementById('rfActionType').value = mapping.action_type;
         document.getElementById('rfRPC_SwitchId').value = mapping.RPC_SwitchId || 0;
 
-        if (mapping.action_type === 4 && mapping.http_steps && mapping.http_steps.length > 0) {
-            mapping.http_steps.forEach(stepData => {
+        if (mapping.action_type === 4 && mapping.http_request_chain && mapping.http_request_chain.length > 0) {
+            mapping.http_request_chain.forEach(stepData => {
                 addHttpStepField(stepData);
             });
         } else if (mapping.action_type === 4) { // HTTP action but no steps, add one empty
@@ -890,7 +909,7 @@ function saveRfMapping() {
         // Include http steps data only for HTTP action type
         ...(actionType === 4 && {
             num_http_steps: numHttpSteps,
-            http_steps: httpSteps
+            http_request_chain: httpSteps
         }),
         enabled: (index === -1) ? true : undefined // Default to true for new mappings; for edit, 'enabled' is not sent or handled by this command.
     };
@@ -944,7 +963,7 @@ function connectWebSocket() {
 
     socket.onclose = function(event) {
         console.log('WebSocket disconnected. Reason:', event.reason, 'Code:', event.code);
-        setTimeout(connectWebSocket, 5000); // Try to reconnect every 5 seconds
+        setTimeout(connectWebSocket, 5000); // Try to reconnect every 5 second
     };
 
     socket.onerror = function(error) {
@@ -1034,6 +1053,7 @@ document.addEventListener('DOMContentLoaded', function() {
         }
         submitButton.disabled = true; submitButton.innerHTML = 'Uploading...';
         showPaneAlert('systemMaintenancePane', 'Uploading firmware... Do not navigate away.', 'info', 0);
+        if (socket && socket.readyState === WebSocket.OPEN) socket.close(1000, "Firmware update initiated.");
 
         const xhr = new XMLHttpRequest();
         xhr.open('POST', '/update', true);
@@ -1048,6 +1068,37 @@ document.addEventListener('DOMContentLoaded', function() {
         xhr.onerror = function() {
             submitButton.disabled = false; submitButton.innerHTML = 'Upload Firmware';
             showPaneAlert('systemMaintenancePane', 'Firmware upload network error.', 'danger', 0);
+        };
+        xhr.send(formData);
+    });
+
+    const restoreForm = document.getElementById('restoreConfigForm');
+    restoreForm.addEventListener('submit', function(event) {
+        event.preventDefault();
+        const formData = new FormData(restoreForm);
+        const fileInput = restoreForm.querySelector('input[type="file"]');
+        const submitButton = restoreForm.querySelector('button[type="submit"]');
+        
+        if (!fileInput.files || fileInput.files.length === 0) {
+            showPaneAlert('systemMaintenancePane', 'Please select a backup file first.', 'warning'); return;
+        }
+        submitButton.disabled = true; submitButton.innerHTML = 'Restoring...';
+        showPaneAlert('systemMaintenancePane', 'Restoring configuration... Device will reboot.', 'info', 0);
+        if (socket && socket.readyState === WebSocket.OPEN) socket.close(1000, "Configuration restore initiated.");
+
+        const xhr = new XMLHttpRequest();
+        xhr.open('POST', '/restore', true);
+        xhr.onload = function() {
+            submitButton.disabled = false; submitButton.innerHTML = 'Restore';
+            if (xhr.status === 200) {
+                try { const response = JSON.parse(xhr.responseText);
+                    showPaneAlert('systemMaintenancePane', response.message, response.success ? 'success' : 'danger', 0);
+                } catch (e) { showPaneAlert('systemMaintenancePane', 'Error parsing server response.', 'danger', 0); }
+            } else { showPaneAlert('systemMaintenancePane', `Restore error: Server status ${xhr.status}`, 'danger', 0); }
+        };
+        xhr.onerror = function() {
+            submitButton.disabled = false; submitButton.innerHTML = 'Restore';
+            showPaneAlert('systemMaintenancePane', 'Restore network error.', 'danger', 0);
         };
         xhr.send(formData);
     });
